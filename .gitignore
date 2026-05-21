@@ -1,0 +1,19 @@
+node_modules/
+dist/
+coverage/
+
+# Local env/secrets
+.env
+.env.*
+!.env.example
+
+# Logs and generated packages
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+*.tgz
+
+# OS/editor noise
+.DS_Store

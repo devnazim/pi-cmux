@@ -1,0 +1,46 @@
+{
+  "name": "@devnazim/pi-cmux",
+  "version": "0.1.0",
+  "description": "cmux notifications and status integration for pi.",
+  "type": "module",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "cmux",
+    "notifications",
+    "coding-agent"
+  ],
+  "license": "MIT",
+  "author": "devnazim",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/devnazim/pi-cmux.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "tsx --test tests/*.test.ts",
+    "prepublishOnly": "npm test && npm run check"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^0.75.4",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.20.6",
+    "typescript": "^5.9.3"
+  }
+}
