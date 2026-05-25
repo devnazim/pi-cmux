@@ -41,6 +41,7 @@ function nonEmpty(value: string | undefined): string | undefined {
 
 export function isInCmuxEnv(env: CmuxEnv = process.env, exists: ExistsFn = existsSync): boolean {
   if (nonEmpty(env.CMUX_WORKSPACE_ID)) return true;
+  if (nonEmpty(env.CMUX_TAB_ID)) return true;
   if (nonEmpty(env.CMUX_SOCKET_PATH)) return true;
   return exists(DEFAULT_CMUX_SOCKET_PATH);
 }
@@ -59,6 +60,43 @@ export function getSurfaceId(env: CmuxEnv = process.env): string | undefined {
   return nonEmpty(env.CMUX_SURFACE_ID) ?? nonEmpty(env.CMUX_PANEL_ID);
 }
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function surfaceListEntries(value: unknown): unknown[] {
+  if (Array.isArray(value)) return value;
+  if (!isRecord(value)) return [];
+
+  for (const key of ["surfaces", "data", "items"]) {
+    const entries = value[key];
+    if (Array.isArray(entries)) return entries;
+  }
+
+  return [];
+}
+
+export function pickBestSurfaceId(surfaceList: unknown): string | undefined {
+  const surfaces = surfaceListEntries(surfaceList)
+    .filter(isRecord)
+    .map((surface) => ({ id: nonEmpty(typeof surface.id === "string" ? surface.id : undefined), focused: surface.focused, selected: surface.selected }))
+    .filter((surface): surface is { id: string; focused: unknown; selected: unknown } => surface.id !== undefined);
+
+  return (
+    surfaces.find((surface) => surface.focused === true)?.id ??
+    surfaces.find((surface) => surface.selected === true)?.id ??
+    surfaces[0]?.id
+  );
+}
+
+export function parseSurfaceListOutput(output: string): string | undefined {
+  return pickBestSurfaceId(JSON.parse(output));
+}
+
+export function buildSurfaceListArgs(workspaceId: string): string[] {
+  return ["rpc", "surface.list", JSON.stringify({ workspace_id: workspaceId })];
+}
+
 export function normalizeLogLevel(level: PiCmuxLogLevel | undefined): string | undefined {
   return level === "warn" ? "warning" : level;
 }
@@ -70,14 +108,18 @@ export function formatNotificationBody(input: Pick<CmuxNotificationInput, "subti
   return baseBody ? `${paneLabel} ${baseBody}` : paneLabel;
 }
 
-export function buildNotificationArgs(input: CmuxNotificationInput, env: CmuxEnv = process.env, paneLabel = ""): string[] {
+export function buildNotificationArgs(
+  input: CmuxNotificationInput,
+  env: CmuxEnv = process.env,
+  paneLabel = "",
+  resolvedSurfaceId = getSurfaceId(env),
+): string[] {
   const body = formatNotificationBody(input, paneLabel);
   const payload: { title: string; body?: string; surface_id?: string } = { title: input.title };
   if (body) payload.body = body;
 
-  const surfaceId = getSurfaceId(env);
-  if (surfaceId) {
-    payload.surface_id = surfaceId;
+  if (resolvedSurfaceId) {
+    payload.surface_id = resolvedSurfaceId;
     return ["rpc", "notification.create_for_surface", JSON.stringify(payload)];
   }
 
@@ -95,15 +137,18 @@ export function buildClearStatusArgs(key: string): string[] {
   return ["clear-status", key];
 }
 
-export function buildReportShellStateArgs(state: CmuxShellState, env: CmuxEnv = process.env): string[] | undefined {
+export function buildReportShellStateArgs(
+  state: CmuxShellState,
+  env: CmuxEnv = process.env,
+  resolvedSurfaceId = getSurfaceId(env),
+): string[] | undefined {
   const workspaceId = getWorkspaceId(env);
-  const surfaceId = getSurfaceId(env);
-  if (!workspaceId || !surfaceId) return undefined;
+  if (!workspaceId || !resolvedSurfaceId) return undefined;
 
   return [
     "rpc",
     "surface.report_shell_state",
-    JSON.stringify({ workspace_id: workspaceId, surface_id: surfaceId, state }),
+    JSON.stringify({ workspace_id: workspaceId, surface_id: resolvedSurfaceId, state }),
   ];
 }
 
@@ -127,6 +172,26 @@ export const execFileRunner: CommandRunner = (command, args) =>
       });
     });
   });
+
+export async function resolveCmuxSurfaceId(
+  env: CmuxEnv = process.env,
+  exists: ExistsFn = existsSync,
+  runner: CommandRunner = execFileRunner,
+): Promise<string | undefined> {
+  const explicitSurfaceId = getSurfaceId(env);
+  if (explicitSurfaceId) return explicitSurfaceId;
+
+  const workspaceId = getWorkspaceId(env);
+  if (!workspaceId) return undefined;
+
+  try {
+    const result = await runner(resolveCmuxCli(env, exists), buildSurfaceListArgs(workspaceId));
+    if (result.exitCode !== 0) return undefined;
+    return parseSurfaceListOutput(result.stdout);
+  } catch {
+    return undefined;
+  }
+}
 
 export async function getTmuxPaneLabel(env: CmuxEnv = process.env, runner: CommandRunner = execFileRunner): Promise<string> {
   const pane = nonEmpty(env.TMUX_PANE);
@@ -164,11 +229,14 @@ export class CmuxClient {
   async notify(input: CmuxNotificationInput): Promise<void> {
     if (!this.isAvailable()) return;
     const paneLabel = await getTmuxPaneLabel(this.env, this.runner);
-    await this.run(buildNotificationArgs(input, this.env, paneLabel));
+    const surfaceId = await this.resolveSurfaceId();
+    await this.run(buildNotificationArgs(input, this.env, paneLabel, surfaceId));
   }
 
   async reportShellState(state: CmuxShellState): Promise<void> {
-    const args = buildReportShellStateArgs(state, this.env);
+    if (!this.isAvailable()) return;
+    const surfaceId = await this.resolveSurfaceId();
+    const args = buildReportShellStateArgs(state, this.env, surfaceId);
     if (args) await this.run(args);
   }
 
@@ -227,6 +295,10 @@ export class CmuxClient {
   private getSupportedCliCommands(): Promise<Set<string>> {
     this.supportedCommandsPromise ??= this.readSupportedCliCommands();
     return this.supportedCommandsPromise;
+  }
+
+  private async resolveSurfaceId(): Promise<string | undefined> {
+    return resolveCmuxSurfaceId(this.env, this.exists, this.runner);
   }
 
   private async readSupportedCliCommands(): Promise<Set<string>> {

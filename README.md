@@ -43,15 +43,18 @@ All cmux calls are best-effort. If cmux is unavailable or a command fails, pi co
 `pi-cmux` detects cmux with:
 
 - `CMUX_WORKSPACE_ID`
+- `CMUX_TAB_ID`
 - any non-empty `CMUX_SOCKET_PATH` (including remote relay values like `127.0.0.1:<port>`)
 - `/tmp/cmux.sock` as a final fallback
 
 It resolves the cmux CLI with `CMUX_BUNDLED_CLI_PATH`, falling back to `cmux` on `PATH`.
 
-For SSH/tmux/surface-aware notifications, it targets the active cmux surface when either env var exists:
+For SSH/tmux/surface-aware notifications, it targets the active cmux surface by preferring explicit env vars:
 
 - `CMUX_SURFACE_ID`
 - `CMUX_PANEL_ID`
+
+If neither is present but `CMUX_WORKSPACE_ID` or `CMUX_TAB_ID` exists, `pi-cmux` asks cmux for that workspace's surfaces with `surface.list` and chooses the focused surface, then the selected surface, then the first surface.
 
 When a surface is available, notifications use:
 
@@ -137,4 +140,4 @@ npm test
 npm run check
 ```
 
-The implementation no-ops outside cmux, targets notifications to the active surface when possible, adds tmux pane labels and pi session names for disambiguation, probes optional legacy commands before using them, keeps legacy status calls best-effort in the background, and executes commands without shell interpolation.
+The implementation no-ops outside cmux, targets notifications and shell-state reports to the active surface when possible, infers SSH/tmux surfaces with `surface.list`, adds tmux pane labels and pi session names for disambiguation, probes optional legacy commands before using them, keeps legacy status calls best-effort in the background, and executes commands without shell interpolation.

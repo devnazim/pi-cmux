@@ -1,6 +1,6 @@
 {
   "name": "@devnazim/pi-cmux",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "cmux notifications and status integration for pi.",
   "type": "module",
   "keywords": [

@@ -19,6 +19,7 @@ test("detects cmux from workspace id, socket env, or default socket", () => {
   assert.equal(isInCmuxEnv({}, () => false), false);
   assert.equal(isInCmuxEnv({}, (path) => path === "/tmp/cmux.sock"), true);
   assert.equal(isInCmuxEnv({ CMUX_WORKSPACE_ID: "workspace:1" }, () => false), true);
+  assert.equal(isInCmuxEnv({ CMUX_TAB_ID: "tab:1" }, () => false), true);
   assert.equal(isInCmuxEnv({ CMUX_SOCKET_PATH: "/tmp/custom-cmux.sock" }, () => false), true);
   assert.equal(isInCmuxEnv({ CMUX_SOCKET_PATH: "127.0.0.1:<port>" }, () => false), true);
 });
@@ -106,6 +107,101 @@ test("client no-ops outside cmux and swallows command failures", async () => {
     await new CmuxClient({ env: { CMUX_WORKSPACE_ID: "workspace:1" }, exists: () => false, runner }).setStatus("pi", "working");
   });
   assert.equal(calls, 1);
+});
+
+test("client resolves workspace surface for notifications", async () => {
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const runner: CommandRunner = async (command, args) => {
+    calls.push({ command, args });
+    if (args[1] === "surface.list") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify([
+          { id: "surface:first" },
+          { id: "surface:selected", selected: true },
+          { id: "surface:focused", focused: true },
+        ]),
+        stderr: "",
+      };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  const client = new CmuxClient({ env: { CMUX_WORKSPACE_ID: "workspace:1" }, exists: () => false, runner });
+  await client.notify({ title: "Pi done" });
+
+  assert.equal(calls.length, 2);
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.list"]);
+  assert.deepEqual(JSON.parse(calls[0].args[2]), { workspace_id: "workspace:1" });
+  assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create_for_surface"]);
+  assert.deepEqual(JSON.parse(calls[1].args[2]), { title: "Pi done", surface_id: "surface:focused" });
+});
+
+test("client falls back to generic notification when workspace surface cannot be resolved", async (t) => {
+  const cases: Array<{ name: string; result: { exitCode: number; stdout: string; stderr: string } }> = [
+    { name: "surface.list fails", result: { exitCode: 1, stdout: "", stderr: "failed" } },
+    { name: "surface.list returns invalid JSON", result: { exitCode: 0, stdout: "not json", stderr: "" } },
+    { name: "surface.list returns no surfaces", result: { exitCode: 0, stdout: JSON.stringify([]), stderr: "" } },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const calls: Array<readonly string[]> = [];
+      const runner: CommandRunner = async (_command, args) => {
+        calls.push(args);
+        if (args[1] === "surface.list") return entry.result;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      };
+
+      await new CmuxClient({ env: { CMUX_WORKSPACE_ID: "workspace:1" }, exists: () => false, runner }).notify({ title: "Done" });
+
+      assert.deepEqual(calls.map((args) => args[1]), ["surface.list", "notification.create"]);
+      assert.deepEqual(JSON.parse(calls[1][2]), { title: "Done" });
+    });
+  }
+});
+
+test("client reports shell state with resolved workspace surface", async () => {
+  const calls: Array<readonly string[]> = [];
+  const runner: CommandRunner = async (_command, args) => {
+    calls.push(args);
+    if (args[1] === "surface.list") return { exitCode: 0, stdout: JSON.stringify({ surfaces: [{ id: "surface:9", selected: true }] }), stderr: "" };
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  await new CmuxClient({ env: { CMUX_WORKSPACE_ID: "workspace:1" }, exists: () => false, runner }).reportShellState("running");
+
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.list", "surface.report_shell_state"]);
+  assert.deepEqual(JSON.parse(calls[1][2]), {
+    workspace_id: "workspace:1",
+    surface_id: "surface:9",
+    state: "running",
+  });
+});
+
+test("client prefers explicit surface env and does not call surface.list", async () => {
+  const calls: Array<readonly string[]> = [];
+  const runner: CommandRunner = async (_command, args) => {
+    calls.push(args);
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  const client = new CmuxClient({
+    env: { CMUX_WORKSPACE_ID: "workspace:1", CMUX_SURFACE_ID: "surface:explicit" },
+    exists: () => false,
+    runner,
+  });
+
+  await client.notify({ title: "Done" });
+  await client.reportShellState("prompt");
+
+  assert.deepEqual(calls.map((args) => args[1]), ["notification.create_for_surface", "surface.report_shell_state"]);
+  assert.deepEqual(JSON.parse(calls[0][2]), { title: "Done", surface_id: "surface:explicit" });
+  assert.deepEqual(JSON.parse(calls[1][2]), {
+    workspace_id: "workspace:1",
+    surface_id: "surface:explicit",
+    state: "prompt",
+  });
 });
 
 test("client reports surface shell state explicitly", async () => {
