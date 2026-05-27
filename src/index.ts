@@ -9,6 +9,7 @@ const STATUS_WORKING = { icon: "terminal", color: "#f59e0b" };
 const STATUS_QUEUED = { icon: "clock", color: "#3b82f6" };
 
 type CmuxGlobal = { [key: symbol]: PiCmuxNotifier | undefined };
+type NotificationCmuxClient = Pick<CmuxClient, "setStatus" | "clearStatus" | "notify" | "log">;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -41,6 +42,40 @@ export function formatDoneTitle(sessionName: string | undefined): string {
   return name ? `Pi done: ${name}` : "Pi done";
 }
 
+export async function handlePiCmuxNotification(
+  notification: PiCmuxNotification,
+  config: ReturnType<typeof loadConfig>,
+  cmux: NotificationCmuxClient,
+): Promise<void> {
+  const source = notification.source ?? "pi";
+  const statusKey = notification.status?.key ?? source;
+
+  if (shouldShowPopup(notification, config)) {
+    await cmux.notify({ title: notification.title, subtitle: notification.subtitle, body: notification.body });
+  }
+
+  const tasks: Array<Promise<void>> = [];
+
+  if (config.status && notification.status) {
+    if (notification.status.action === "clear") {
+      tasks.push(cmux.clearStatus(statusKey));
+    } else {
+      tasks.push(
+        cmux.setStatus(statusKey, notification.status.text, {
+          icon: notification.status.icon,
+          color: notification.status.color,
+        }),
+      );
+    }
+  }
+
+  if (config.logs && notification.log !== false) {
+    tasks.push(cmux.log(notificationLogMessage(notification), { level: notification.level ?? "info", source }));
+  }
+
+  await Promise.all(tasks);
+}
+
 export default function piCmuxExtension(pi: ExtensionAPI): void {
   const config = loadConfig();
   const cmux = new CmuxClient();
@@ -64,33 +99,9 @@ export default function piCmuxExtension(pi: ExtensionAPI): void {
     return formatDoneTitle(pi.getSessionName());
   }
 
-  async function handleNotification(notification: PiCmuxNotification): Promise<void> {
-    const source = notification.source ?? "pi";
-    const statusKey = notification.status?.key ?? source;
-
-    if (config.status && notification.status) {
-      if (notification.status.action === "clear") {
-        await cmux.clearStatus(statusKey);
-      } else {
-        await cmux.setStatus(statusKey, notification.status.text, {
-          icon: notification.status.icon,
-          color: notification.status.color,
-        });
-      }
-    }
-
-    if (shouldShowPopup(notification, config)) {
-      await cmux.notify({ title: notification.title, subtitle: notification.subtitle, body: notification.body });
-    }
-
-    if (config.logs && notification.log !== false) {
-      await cmux.log(notificationLogMessage(notification), { level: notification.level ?? "info", source });
-    }
-  }
-
   const notifier: PiCmuxNotifier = async (notification) => {
     try {
-      if (isNotification(notification)) await handleNotification(notification);
+      if (isNotification(notification)) await handlePiCmuxNotification(notification, config, cmux);
     } catch {
       // Optional cross-extension notifications must never affect callers.
     }
