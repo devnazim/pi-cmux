@@ -6,6 +6,8 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`.
 
+Compatibility: `pi-cmux` uses Pi's extension API via a peer dependency and is intended to work across current Pi releases.
+
 ## Install
 
 After publishing to npm:
