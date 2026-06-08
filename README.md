@@ -72,6 +72,8 @@ cmux rpc notification.create '{"title":"..."}'
 
 If `TMUX_PANE` is set, `pi-cmux` asks tmux for a readable pane label and prefixes notification bodies with it, e.g. `[dev:1 %2] Ready for input`. If tmux lookup fails, it falls back to the raw pane id.
 
+When running inside tmux, `pi-cmux` also refreshes `CMUX_*` values from `tmux show-environment` before each cmux call. This helps after SSH relay reconnects, such as when a laptop sleeps and wakes with a new `CMUX_SOCKET_PATH` port. Existing processes cannot recover if tmux itself still has stale cmux environment values; in that case, start a new cmux/tmux pane or restart pi from a shell with fresh `CMUX_*` variables.
+
 This avoids terminal OSC notifications and works through SSH/tmux when the cmux shell integration exposes the needed env/socket/CLI access in the remote environment. Without that cmux environment, the extension silently no-ops.
 
 Current cmux builds expose notifications and surface shell-state RPCs, but may not expose older `set-status`, `clear-status`, or `log` CLI commands. `pi-cmux` uses the shell-state RPC for surface activity, probes `cmux --help` before calling optional legacy status/log commands, and keeps legacy status calls off the critical agent lifecycle path.

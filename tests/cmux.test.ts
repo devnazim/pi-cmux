@@ -11,6 +11,7 @@ import {
   formatNotificationBody,
   getTmuxPaneLabel,
   isInCmuxEnv,
+  parseTmuxEnvironmentOutput,
   resolveCmuxCli,
   type CommandRunner,
 } from "../src/cmux.js";
@@ -91,6 +92,152 @@ test("gets tmux pane label and falls back to raw pane id", async () => {
   const failingRunner: CommandRunner = async () => ({ exitCode: 1, stdout: "", stderr: "no pane" });
   assert.equal(await getTmuxPaneLabel({ TMUX_PANE: "%2" }, failingRunner), "[%2]");
   assert.equal(await getTmuxPaneLabel({}, failingRunner), "");
+});
+
+test("parses cmux values from tmux environment output", () => {
+  assert.deepEqual(
+    parseTmuxEnvironmentOutput([
+      "CMUX_SOCKET_PATH=127.0.0.1:60000",
+      "CMUX_WORKSPACE_ID=workspace:new",
+      "CMUX_SURFACE_ID=surface:new",
+      "CMUX_REMOTE_TRANSPORT=ws",
+      "SHELL=/bin/bash",
+      "-CMUX_PANEL_ID",
+      "-CMUX_SHELL_INTEGRATION_DIR",
+    ].join("\n")),
+    {
+      CMUX_SOCKET_PATH: "127.0.0.1:60000",
+      CMUX_WORKSPACE_ID: "workspace:new",
+      CMUX_SURFACE_ID: "surface:new",
+      CMUX_REMOTE_TRANSPORT: "ws",
+      CMUX_PANEL_ID: undefined,
+      CMUX_SHELL_INTEGRATION_DIR: undefined,
+    },
+  );
+});
+
+test("client refreshes cmux env from tmux before notifying", async () => {
+  const calls: Array<{ command: string; args: readonly string[]; socketPath: string | undefined }> = [];
+  const showEnvironmentTmuxValues: Array<string | undefined> = [];
+  const runner: CommandRunner = async (command, args, options) => {
+    if (command === "tmux" && args[0] === "show-environment") {
+      showEnvironmentTmuxValues.push(options?.env?.TMUX);
+      return {
+        exitCode: 0,
+        stdout: [
+          "CMUX_SOCKET_PATH=127.0.0.1:60000",
+          "CMUX_WORKSPACE_ID=workspace:new",
+          "CMUX_SURFACE_ID=surface:new",
+        ].join("\n"),
+        stderr: "",
+      };
+    }
+
+    calls.push({ command, args, socketPath: options?.env?.CMUX_SOCKET_PATH });
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  await new CmuxClient({
+    env: {
+      TMUX: "/tmp/tmux-1000/default,1,0",
+      CMUX_SOCKET_PATH: "127.0.0.1:50000",
+      CMUX_WORKSPACE_ID: "workspace:old",
+      CMUX_SURFACE_ID: "surface:old",
+    },
+    exists: () => false,
+    runner,
+  }).notify({ title: "Done" });
+
+  assert.deepEqual(showEnvironmentTmuxValues, ["/tmp/tmux-1000/default,1,0", "/tmp/tmux-1000/default,1,0"]);
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].socketPath, "127.0.0.1:60000");
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "notification.create_for_surface"]);
+  assert.deepEqual(JSON.parse(calls[0].args[2]), { title: "Done", surface_id: "surface:new" });
+});
+
+test("client preserves inherited cmux values when tmux env refresh is partial", async () => {
+  const calls: Array<{ args: readonly string[]; socketPath: string | undefined }> = [];
+  const runner: CommandRunner = async (command, args, options) => {
+    if (command === "tmux" && args[0] === "show-environment") {
+      if (args.includes("-g")) {
+        return { exitCode: 0, stdout: "CMUX_SOCKET_PATH=127.0.0.1:60000\n", stderr: "" };
+      }
+      return { exitCode: 1, stdout: "", stderr: "no session" };
+    }
+
+    calls.push({ args, socketPath: options?.env?.CMUX_SOCKET_PATH });
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  await new CmuxClient({
+    env: {
+      TMUX: "/tmp/tmux-1000/default,1,0",
+      CMUX_SOCKET_PATH: "127.0.0.1:50000",
+      CMUX_WORKSPACE_ID: "workspace:old",
+      CMUX_SURFACE_ID: "surface:old",
+    },
+    exists: () => false,
+    runner,
+  }).notify({ title: "Done" });
+
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].socketPath, "127.0.0.1:60000");
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "notification.create_for_surface"]);
+  assert.deepEqual(JSON.parse(calls[0].args[2]), { title: "Done", surface_id: "surface:old" });
+});
+
+test("client clears stale process cmux env when tmux marks values unset", async () => {
+  let calls = 0;
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "tmux" && args[0] === "show-environment") {
+      return {
+        exitCode: 0,
+        stdout: ["-CMUX_SOCKET_PATH", "-CMUX_WORKSPACE_ID", "-CMUX_TAB_ID", "-CMUX_SURFACE_ID", "-CMUX_PANEL_ID"].join("\n"),
+        stderr: "",
+      };
+    }
+
+    calls++;
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  await new CmuxClient({
+    env: {
+      TMUX: "/tmp/tmux-1000/default,1,0",
+      CMUX_SOCKET_PATH: "127.0.0.1:50000",
+      CMUX_WORKSPACE_ID: "workspace:old",
+      CMUX_SURFACE_ID: "surface:old",
+    },
+    exists: () => false,
+    runner,
+  }).notify({ title: "Done" });
+
+  assert.equal(calls, 0);
+});
+
+test("client clears stale process cmux env when tmux omits values", async () => {
+  let calls = 0;
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "tmux" && args[0] === "show-environment") {
+      return { exitCode: 0, stdout: "SHELL=/bin/bash\n", stderr: "" };
+    }
+
+    calls++;
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  await new CmuxClient({
+    env: {
+      TMUX: "/tmp/tmux-1000/default,1,0",
+      CMUX_SOCKET_PATH: "127.0.0.1:50000",
+      CMUX_WORKSPACE_ID: "workspace:old",
+      CMUX_SURFACE_ID: "surface:old",
+    },
+    exists: () => false,
+    runner,
+  }).notify({ title: "Done" });
+
+  assert.equal(calls, 0);
 });
 
 test("client no-ops outside cmux and swallows command failures", async () => {
@@ -323,6 +470,46 @@ test("client uses optional legacy log command only when supported", async () => 
     source: "pi",
   });
   assert.deepEqual(supportedCalls, [["--help"], ["log", "--level", "success", "--source", "pi", "--", "Done"]]);
+});
+
+test("client re-probes optional commands when refreshed bundled cli path changes", async () => {
+  let bundledCliPath = "/old/cmux";
+  const calls: Array<{ command: string; args: readonly string[] }> = [];
+  const runner: CommandRunner = async (command, args) => {
+    if (command === "tmux" && args[0] === "show-environment") {
+      return {
+        exitCode: 0,
+        stdout: [`CMUX_BUNDLED_CLI_PATH=${bundledCliPath}`, "CMUX_WORKSPACE_ID=workspace:1"].join("\n"),
+        stderr: "",
+      };
+    }
+
+    calls.push({ command, args });
+    if (args[0] === "--help") {
+      return {
+        exitCode: 0,
+        stdout: command === "/new/cmux" ? "Commands:\n  log   Write log entry\n" : "Commands:\n  ping   Check connectivity\n",
+        stderr: "",
+      };
+    }
+    return { exitCode: 0, stdout: "", stderr: "" };
+  };
+
+  const client = new CmuxClient({
+    env: { TMUX: "/tmp/tmux-1000/default,1,0", CMUX_BUNDLED_CLI_PATH: "/old/cmux", CMUX_WORKSPACE_ID: "workspace:old" },
+    exists: (path) => path === "/old/cmux" || path === "/new/cmux",
+    runner,
+  });
+
+  await client.log("Old");
+  bundledCliPath = "/new/cmux";
+  await client.log("New");
+
+  assert.deepEqual(calls, [
+    { command: "/old/cmux", args: ["--help"] },
+    { command: "/new/cmux", args: ["--help"] },
+    { command: "/new/cmux", args: ["log", "--", "New"] },
+  ]);
 });
 
 test("client sends tmux-labeled cmux notifications", async () => {

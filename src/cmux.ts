@@ -12,7 +12,11 @@ export interface CommandResult {
   stderr: string;
 }
 
-export type CommandRunner = (command: string, args: readonly string[]) => Promise<CommandResult>;
+export interface CommandRunOptions {
+  env?: CmuxEnv;
+}
+
+export type CommandRunner = (command: string, args: readonly string[], options?: CommandRunOptions) => Promise<CommandResult>;
 
 export interface CmuxNotificationInput {
   title: string;
@@ -58,6 +62,60 @@ export function getWorkspaceId(env: CmuxEnv = process.env): string | undefined {
 
 export function getSurfaceId(env: CmuxEnv = process.env): string | undefined {
   return nonEmpty(env.CMUX_SURFACE_ID) ?? nonEmpty(env.CMUX_PANEL_ID);
+}
+
+export function parseTmuxEnvironmentOutput(output: string): CmuxEnv {
+  const env: CmuxEnv = {};
+
+  for (const line of output.split(/\r?\n/)) {
+    if (line.startsWith("-")) {
+      const key = line.slice(1);
+      if (key.startsWith("CMUX_")) env[key] = undefined;
+      continue;
+    }
+
+    const equalsIndex = line.indexOf("=");
+    if (equalsIndex <= 0) continue;
+
+    const key = line.slice(0, equalsIndex);
+    if (key.startsWith("CMUX_")) env[key] = line.slice(equalsIndex + 1);
+  }
+
+  return env;
+}
+
+export async function getTmuxCmuxEnv(env: CmuxEnv = process.env, runner: CommandRunner = execFileRunner): Promise<CmuxEnv> {
+  if (!nonEmpty(env.TMUX)) return {};
+
+  const readEnvironment = async (args: string[]): Promise<CmuxEnv | undefined> => {
+    try {
+      const result = await runner("tmux", args, { env });
+      return result.exitCode === 0 ? parseTmuxEnvironmentOutput(result.stdout) : undefined;
+    } catch {
+      return undefined;
+    }
+  };
+
+  const [globalEnv, sessionEnv] = await Promise.all([
+    readEnvironment(["show-environment", "-g"]),
+    readEnvironment(["show-environment"]),
+  ]);
+  if (!globalEnv && !sessionEnv) return {};
+
+  const refreshedEnv = { ...globalEnv, ...sessionEnv };
+  if (globalEnv && sessionEnv) {
+    for (const key of Object.keys(env)) {
+      if (key.startsWith("CMUX_") && !Object.prototype.hasOwnProperty.call(refreshedEnv, key)) {
+        refreshedEnv[key] = undefined;
+      }
+    }
+  }
+
+  return refreshedEnv;
+}
+
+export async function resolveRuntimeCmuxEnv(env: CmuxEnv = process.env, runner: CommandRunner = execFileRunner): Promise<CmuxEnv> {
+  return { ...env, ...(await getTmuxCmuxEnv(env, runner)) };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
@@ -161,16 +219,37 @@ export function buildLogArgs(message: string, options: CmuxLogOptions = {}): str
   return args;
 }
 
-export const execFileRunner: CommandRunner = (command, args) =>
+function processEnvWith(overrides: CmuxEnv): NodeJS.ProcessEnv {
+  const env = { ...process.env };
+
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+
+  return env;
+}
+
+export const execFileRunner: CommandRunner = (command, args, options) =>
   new Promise((resolve) => {
-    execFile(command, [...args], { encoding: "utf8", timeout: 3_000, maxBuffer: 1024 * 1024 }, (error, stdout, stderr) => {
-      const maybeCode = (error as NodeJS.ErrnoException | null)?.code;
-      resolve({
-        exitCode: typeof maybeCode === "number" ? maybeCode : error ? 1 : 0,
-        stdout: stdout ?? "",
-        stderr: stderr ?? "",
-      });
-    });
+    execFile(
+      command,
+      [...args],
+      {
+        encoding: "utf8",
+        timeout: 3_000,
+        maxBuffer: 1024 * 1024,
+        ...(options?.env ? { env: processEnvWith(options.env) } : {}),
+      },
+      (error, stdout, stderr) => {
+        const maybeCode = (error as NodeJS.ErrnoException | null)?.code;
+        resolve({
+          exitCode: typeof maybeCode === "number" ? maybeCode : error ? 1 : 0,
+          stdout: stdout ?? "",
+          stderr: stderr ?? "",
+        });
+      },
+    );
   });
 
 export async function resolveCmuxSurfaceId(
@@ -185,7 +264,7 @@ export async function resolveCmuxSurfaceId(
   if (!workspaceId) return undefined;
 
   try {
-    const result = await runner(resolveCmuxCli(env, exists), buildSurfaceListArgs(workspaceId));
+    const result = await runner(resolveCmuxCli(env, exists), buildSurfaceListArgs(workspaceId), { env });
     if (result.exitCode !== 0) return undefined;
     return parseSurfaceListOutput(result.stdout);
   } catch {
@@ -198,7 +277,7 @@ export async function getTmuxPaneLabel(env: CmuxEnv = process.env, runner: Comma
   if (!pane) return "";
 
   try {
-    const result = await runner("tmux", ["display-message", "-p", "-t", pane, "-F", "#{session_name}:#{window_index} #{pane_id}"]);
+    const result = await runner("tmux", ["display-message", "-p", "-t", pane, "-F", "#{session_name}:#{window_index} #{pane_id}"], { env });
     if (result.exitCode === 0) {
       const text = result.stdout.trim();
       if (text) return `[${text}]`;
@@ -211,7 +290,7 @@ export async function getTmuxPaneLabel(env: CmuxEnv = process.env, runner: Comma
 }
 
 export class CmuxClient {
-  private supportedCommandsPromise?: Promise<Set<string>>;
+  private readonly supportedCommandsPromises = new Map<string, Promise<Set<string>>>();
   private legacyStatusQueue: Promise<void> = Promise.resolve();
 
   constructor(
@@ -227,38 +306,45 @@ export class CmuxClient {
   }
 
   async notify(input: CmuxNotificationInput): Promise<void> {
-    if (!this.isAvailable()) return;
-    const paneLabel = await getTmuxPaneLabel(this.env, this.runner);
-    const surfaceId = await this.resolveSurfaceId();
-    await this.run(buildNotificationArgs(input, this.env, paneLabel, surfaceId));
+    const env = await this.getRuntimeEnv();
+    if (!isInCmuxEnv(env, this.exists)) return;
+
+    const paneLabel = await getTmuxPaneLabel(env, this.runner);
+    const surfaceId = await this.resolveSurfaceId(env);
+    await this.run(buildNotificationArgs(input, env, paneLabel, surfaceId), env);
   }
 
   async reportShellState(state: CmuxShellState): Promise<void> {
-    if (!this.isAvailable()) return;
-    const surfaceId = await this.resolveSurfaceId();
-    const args = buildReportShellStateArgs(state, this.env, surfaceId);
-    if (args) await this.run(args);
+    const env = await this.getRuntimeEnv();
+    if (!isInCmuxEnv(env, this.exists)) return;
+
+    const surfaceId = await this.resolveSurfaceId(env);
+    const args = buildReportShellStateArgs(state, env, surfaceId);
+    if (args) await this.run(args, env);
   }
 
   async setStatus(key: string, text: string, options?: CmuxStatusOptions): Promise<void> {
     await this.enqueueLegacyStatus(async () => {
-      if (await this.supportsCliCommand("set-status")) {
-        await this.run(buildSetStatusArgs(key, text, options));
+      const env = await this.getRuntimeEnv();
+      if (await this.supportsCliCommand("set-status", env)) {
+        await this.run(buildSetStatusArgs(key, text, options), env);
       }
     });
   }
 
   async clearStatus(key: string): Promise<void> {
     await this.enqueueLegacyStatus(async () => {
-      if (await this.supportsCliCommand("clear-status")) {
-        await this.run(buildClearStatusArgs(key));
+      const env = await this.getRuntimeEnv();
+      if (await this.supportsCliCommand("clear-status", env)) {
+        await this.run(buildClearStatusArgs(key), env);
       }
     });
   }
 
   async log(message: string, options?: CmuxLogOptions): Promise<void> {
-    if (await this.supportsCliCommand("log")) {
-      await this.run(buildLogArgs(message, options));
+    const env = await this.getRuntimeEnv();
+    if (await this.supportsCliCommand("log", env)) {
+      await this.run(buildLogArgs(message, options), env);
     }
   }
 
@@ -274,6 +360,10 @@ export class CmuxClient {
     return this.options.runner ?? execFileRunner;
   }
 
+  private async getRuntimeEnv(): Promise<CmuxEnv> {
+    return resolveRuntimeCmuxEnv(this.env, this.runner);
+  }
+
   private enqueueLegacyStatus(task: () => Promise<void>): Promise<void> {
     const next = this.legacyStatusQueue.then(task, task);
     this.legacyStatusQueue = next.catch(() => {
@@ -282,30 +372,35 @@ export class CmuxClient {
     return this.legacyStatusQueue;
   }
 
-  private async supportsCliCommand(commandName: string): Promise<boolean> {
-    if (!this.isAvailable()) return false;
+  private async supportsCliCommand(commandName: string, env: CmuxEnv): Promise<boolean> {
+    if (!isInCmuxEnv(env, this.exists)) return false;
     try {
-      const commands = await this.getSupportedCliCommands();
+      const commands = await this.getSupportedCliCommands(env);
       return commands.has(commandName);
     } catch {
       return false;
     }
   }
 
-  private getSupportedCliCommands(): Promise<Set<string>> {
-    this.supportedCommandsPromise ??= this.readSupportedCliCommands();
-    return this.supportedCommandsPromise;
+  private getSupportedCliCommands(env: CmuxEnv): Promise<Set<string>> {
+    const cli = resolveCmuxCli(env, this.exists);
+    let commands = this.supportedCommandsPromises.get(cli);
+    if (!commands) {
+      commands = this.readSupportedCliCommands(cli, env);
+      this.supportedCommandsPromises.set(cli, commands);
+    }
+    return commands;
   }
 
-  private async resolveSurfaceId(): Promise<string | undefined> {
-    return resolveCmuxSurfaceId(this.env, this.exists, this.runner);
+  private async resolveSurfaceId(env: CmuxEnv): Promise<string | undefined> {
+    return resolveCmuxSurfaceId(env, this.exists, this.runner);
   }
 
-  private async readSupportedCliCommands(): Promise<Set<string>> {
+  private async readSupportedCliCommands(cli: string, env: CmuxEnv): Promise<Set<string>> {
     const commands = new Set<string>();
 
     try {
-      const result = await this.runner(resolveCmuxCli(this.env, this.exists), ["--help"]);
+      const result = await this.runner(cli, ["--help"], { env });
       const output = `${result.stdout}\n${result.stderr}`;
       for (const line of output.split(/\r?\n/)) {
         const match = line.match(/^\s{2}([a-z][\w-]*)\b/);
@@ -318,10 +413,10 @@ export class CmuxClient {
     return commands;
   }
 
-  private async run(args: string[]): Promise<void> {
-    if (!this.isAvailable()) return;
+  private async run(args: string[], env: CmuxEnv): Promise<void> {
+    if (!isInCmuxEnv(env, this.exists)) return;
     try {
-      await this.runner(resolveCmuxCli(this.env, this.exists), args);
+      await this.runner(resolveCmuxCli(env, this.exists), args, { env });
     } catch {
       // cmux is best-effort; never let notification failures affect pi.
     }
