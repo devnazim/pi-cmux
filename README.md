@@ -10,7 +10,7 @@ Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.
 
 ## Install
 
-After publishing to npm:
+From npm:
 
 ```bash
 pi install npm:@devnazim/pi-cmux
