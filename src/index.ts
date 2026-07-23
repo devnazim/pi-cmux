@@ -10,6 +10,7 @@ const STATUS_QUEUED = { icon: "clock", color: "#3b82f6" };
 
 type CmuxGlobal = { [key: symbol]: PiCmuxNotifier | undefined };
 type NotificationCmuxClient = Pick<CmuxClient, "setStatus" | "clearStatus" | "notify" | "log">;
+type PiCmuxClient = NotificationCmuxClient & Pick<CmuxClient, "reportShellState">;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -76,9 +77,11 @@ export async function handlePiCmuxNotification(
   await Promise.all(tasks);
 }
 
-export default function piCmuxExtension(pi: ExtensionAPI): void {
-  const config = loadConfig();
-  const cmux = new CmuxClient();
+export function registerPiCmuxExtension(
+  pi: ExtensionAPI,
+  config: ReturnType<typeof loadConfig>,
+  cmux: PiCmuxClient,
+): void {
   const cmuxGlobal = globalThis as unknown as CmuxGlobal;
 
   async function setPiStatus(text: string, options: typeof STATUS_WORKING, legacy: "await" | "background" = "background"): Promise<void> {
@@ -114,10 +117,13 @@ export default function piCmuxExtension(pi: ExtensionAPI): void {
   });
 
   pi.on("agent_end", async (_event, ctx) => {
-    if (ctx.hasPendingMessages()) {
-      if (config.status) await setPiStatus("queued", STATUS_QUEUED);
-      return;
+    if (ctx.hasPendingMessages() && config.status) {
+      await setPiStatus("queued", STATUS_QUEUED);
     }
+  });
+
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!ctx.isIdle()) return;
 
     const title = doneTitle();
     const tasks: Array<Promise<void>> = [];
@@ -135,4 +141,8 @@ export default function piCmuxExtension(pi: ExtensionAPI): void {
     if (cmuxGlobal[PI_CMUX_NOTIFY_SYMBOL] === notifier) delete cmuxGlobal[PI_CMUX_NOTIFY_SYMBOL];
     if (config.status) await clearPiStatus("await");
   });
+}
+
+export default function piCmuxExtension(pi: ExtensionAPI): void {
+  registerPiCmuxExtension(pi, loadConfig(), new CmuxClient());
 }

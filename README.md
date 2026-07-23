@@ -6,7 +6,7 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`.
 
-Compatibility: `pi-cmux` uses Pi's extension API via a peer dependency and is intended to work across current Pi releases.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.81.1. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications.
 
 ## Install
 
@@ -33,8 +33,8 @@ pi -e /path/to/pi-cmux
 | pi event | cmux action |
 | --- | --- |
 | Agent starts | mark the active cmux surface as running (`surface.report_shell_state`) |
-| Agent ends with no queued messages | desktop notification (including session name when set) + mark surface as prompt/idle |
-| Agent ends with queued messages | keep/report the active surface as running |
+| Agent run ends with queued messages | keep/report the active surface as running |
+| Agent fully settles | desktop notification (including session name when set) + mark surface as prompt/idle |
 | Session shuts down/reloads | mark surface as prompt/idle |
 | Optional extension notification | popup/status/log best-effort, controlled by the caller |
 
@@ -144,4 +144,4 @@ npm test
 npm run check
 ```
 
-The implementation no-ops outside cmux, targets notifications and shell-state reports to the active surface when possible, infers SSH/tmux surfaces with `surface.list`, adds tmux pane labels and pi session names for disambiguation, probes optional legacy commands before using them, keeps legacy status calls best-effort in the background, and executes commands without shell interpolation.
+The implementation no-ops outside cmux, targets notifications and shell-state reports to the active surface when possible, waits for Pi's fully settled lifecycle state, infers SSH/tmux surfaces with `surface.list`, adds tmux pane labels and pi session names for disambiguation, probes optional legacy commands before using them, keeps legacy status calls best-effort in the background, and executes commands without shell interpolation.
