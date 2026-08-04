@@ -6,7 +6,7 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`.
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.82.1. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.83.0. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications.
 
 ## Install
 
