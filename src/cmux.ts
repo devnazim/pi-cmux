@@ -1,5 +1,7 @@
 import { execFile } from "node:child_process";
-import { existsSync } from "node:fs";
+import { accessSync, constants, existsSync, statSync } from "node:fs";
+import { homedir } from "node:os";
+import { join } from "node:path";
 
 import type { PiCmuxLogLevel } from "./types.js";
 
@@ -36,21 +38,61 @@ export interface CmuxLogOptions {
 
 export type CmuxShellState = "prompt" | "running" | "unknown";
 
-const DEFAULT_CMUX_SOCKET_PATH = "/tmp/cmux.sock";
+const CMUX_STATE_DIRECTORY = join(homedir(), ".local", "state", "cmux");
+const CURRENT_CMUX_SOCKET_PATH = join(CMUX_STATE_DIRECTORY, "cmux.sock");
+const LEGACY_CMUX_SOCKET_PATH = "/tmp/cmux.sock";
+const USER_ID = process.getuid?.();
+const USER_SCOPED_CMUX_SOCKET_PATHS =
+  USER_ID === undefined ? [] : [join(CMUX_STATE_DIRECTORY, `cmux-${USER_ID}.sock`), `/tmp/cmux-${USER_ID}.sock`];
+const TMUX_SHARED_CMUX_ENV_KEYS = new Set([
+  "CMUX_BUNDLED_CLI_PATH",
+  "CMUX_BUNDLE_ID",
+  "CMUXD_UNIX_PATH",
+  "CMUXTERM_REPO_ROOT",
+  "CMUX_DEBUG_LOG",
+  "CMUX_LOAD_GHOSTTY_ZSH_INTEGRATION",
+  "CMUX_PORT",
+  "CMUX_PORT_END",
+  "CMUX_PORT_RANGE",
+  "CMUX_REMOTE_DAEMON_ALLOW_LOCAL_BUILD",
+  "CMUX_SHELL_INTEGRATION",
+  "CMUX_SHELL_INTEGRATION_DIR",
+  "CMUX_SOCKET_ENABLE",
+  "CMUX_SOCKET_MODE",
+  "CMUX_SOCKET_PATH",
+  "CMUX_SSH_ATTEMPT_ID",
+  "CMUX_TAB_ID",
+  "CMUX_TAG",
+  "CMUX_TERMINAL_LIFECYCLE_ID",
+  "CMUX_WORKSPACE_ID",
+]);
 
 function nonEmpty(value: string | undefined): string | undefined {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
+function isExecutableFile(path: string): boolean {
+  try {
+    if (!statSync(path).isFile()) return false;
+    accessSync(path, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export function isInCmuxEnv(env: CmuxEnv = process.env, exists: ExistsFn = existsSync): boolean {
   if (nonEmpty(env.CMUX_WORKSPACE_ID)) return true;
   if (nonEmpty(env.CMUX_TAB_ID)) return true;
+  if (nonEmpty(env.CMUX_SURFACE_ID)) return true;
+  if (nonEmpty(env.CMUX_PANEL_ID)) return true;
   if (nonEmpty(env.CMUX_SOCKET_PATH)) return true;
-  return exists(DEFAULT_CMUX_SOCKET_PATH);
+  if (nonEmpty(env.CMUX_SOCKET)) return true;
+  return exists(CURRENT_CMUX_SOCKET_PATH) || exists(LEGACY_CMUX_SOCKET_PATH) || USER_SCOPED_CMUX_SOCKET_PATHS.some(exists);
 }
 
-export function resolveCmuxCli(env: CmuxEnv = process.env, exists: ExistsFn = existsSync): string {
+export function resolveCmuxCli(env: CmuxEnv = process.env, exists: ExistsFn = isExecutableFile): string {
   const bundled = nonEmpty(env.CMUX_BUNDLED_CLI_PATH);
   if (bundled && exists(bundled)) return bundled;
   return "cmux";
@@ -70,7 +112,7 @@ export function parseTmuxEnvironmentOutput(output: string): CmuxEnv {
   for (const line of output.split(/\r?\n/)) {
     if (line.startsWith("-")) {
       const key = line.slice(1);
-      if (key.startsWith("CMUX_")) env[key] = undefined;
+      if (TMUX_SHARED_CMUX_ENV_KEYS.has(key)) env[key] = undefined;
       continue;
     }
 
@@ -78,7 +120,7 @@ export function parseTmuxEnvironmentOutput(output: string): CmuxEnv {
     if (equalsIndex <= 0) continue;
 
     const key = line.slice(0, equalsIndex);
-    if (key.startsWith("CMUX_")) env[key] = line.slice(equalsIndex + 1);
+    if (TMUX_SHARED_CMUX_ENV_KEYS.has(key)) env[key] = line.slice(equalsIndex + 1);
   }
 
   return env;
@@ -100,18 +142,19 @@ export async function getTmuxCmuxEnv(env: CmuxEnv = process.env, runner: Command
     readEnvironment(["show-environment", "-g"]),
     readEnvironment(["show-environment"]),
   ]);
-  if (!globalEnv && !sessionEnv) return {};
-
-  const refreshedEnv = { ...globalEnv, ...sessionEnv };
-  if (globalEnv && sessionEnv) {
-    for (const key of Object.keys(env)) {
-      if (key.startsWith("CMUX_") && !Object.prototype.hasOwnProperty.call(refreshedEnv, key)) {
-        refreshedEnv[key] = undefined;
-      }
-    }
+  if (!globalEnv && !sessionEnv) {
+    return { CMUX_SURFACE_ID: undefined, CMUX_PANEL_ID: undefined };
   }
 
-  return refreshedEnv;
+  return {
+    ...globalEnv,
+    ...sessionEnv,
+    // cmux intentionally keeps surface identity out of tmux's shared environment.
+    // Resolve the active surface from the refreshed workspace instead of trusting
+    // inherited values that can point at another pane after reconnects or moves.
+    CMUX_SURFACE_ID: undefined,
+    CMUX_PANEL_ID: undefined,
+  };
 }
 
 export async function resolveRuntimeCmuxEnv(env: CmuxEnv = process.env, runner: CommandRunner = execFileRunner): Promise<CmuxEnv> {
@@ -137,11 +180,20 @@ function surfaceListEntries(value: unknown): unknown[] {
 export function pickBestSurfaceId(surfaceList: unknown): string | undefined {
   const surfaces = surfaceListEntries(surfaceList)
     .filter(isRecord)
-    .map((surface) => ({ id: nonEmpty(typeof surface.id === "string" ? surface.id : undefined), focused: surface.focused, selected: surface.selected }))
-    .filter((surface): surface is { id: string; focused: unknown; selected: unknown } => surface.id !== undefined);
+    .map((surface) => ({
+      id: nonEmpty(typeof surface.id === "string" ? surface.id : undefined),
+      focused: surface.focused,
+      selectedInPane: surface.selected_in_pane,
+      selected: surface.selected,
+    }))
+    .filter(
+      (surface): surface is { id: string; focused: unknown; selectedInPane: unknown; selected: unknown } =>
+        surface.id !== undefined,
+    );
 
   return (
     surfaces.find((surface) => surface.focused === true)?.id ??
+    surfaces.find((surface) => surface.selectedInPane === true)?.id ??
     surfaces.find((surface) => surface.selected === true)?.id ??
     surfaces[0]?.id
   );
@@ -173,14 +225,15 @@ export function buildNotificationArgs(
   resolvedSurfaceId = getSurfaceId(env),
 ): string[] {
   const body = formatNotificationBody(input, paneLabel);
-  const payload: { title: string; body?: string; surface_id?: string } = { title: input.title };
+  const payload: { title: string; body?: string; workspace_id?: string; surface_id?: string } = { title: input.title };
   if (body) payload.body = body;
 
-  if (resolvedSurfaceId) {
-    payload.surface_id = resolvedSurfaceId;
-    return ["rpc", "notification.create_for_surface", JSON.stringify(payload)];
-  }
+  const workspaceId = getWorkspaceId(env);
+  if (workspaceId) payload.workspace_id = workspaceId;
+  if (resolvedSurfaceId) payload.surface_id = resolvedSurfaceId;
 
+  // notification.create_for_surface is local-only in current cmux. The scoped
+  // notification.create shape works locally and through SSH/cloud relays.
   return ["rpc", "notification.create", JSON.stringify(payload)];
 }
 
@@ -201,13 +254,12 @@ export function buildReportShellStateArgs(
   resolvedSurfaceId = getSurfaceId(env),
 ): string[] | undefined {
   const workspaceId = getWorkspaceId(env);
-  if (!workspaceId || !resolvedSurfaceId) return undefined;
+  if (!workspaceId) return undefined;
 
-  return [
-    "rpc",
-    "surface.report_shell_state",
-    JSON.stringify({ workspace_id: workspaceId, surface_id: resolvedSurfaceId, state }),
-  ];
+  const payload: { workspace_id: string; surface_id?: string; state: CmuxShellState } = { workspace_id: workspaceId, state };
+  if (resolvedSurfaceId) payload.surface_id = resolvedSurfaceId;
+
+  return ["rpc", "surface.report_shell_state", JSON.stringify(payload)];
 }
 
 export function buildLogArgs(message: string, options: CmuxLogOptions = {}): string[] {
@@ -254,7 +306,7 @@ export const execFileRunner: CommandRunner = (command, args, options) =>
 
 export async function resolveCmuxSurfaceId(
   env: CmuxEnv = process.env,
-  exists: ExistsFn = existsSync,
+  exists: ExistsFn = isExecutableFile,
   runner: CommandRunner = execFileRunner,
 ): Promise<string | undefined> {
   const explicitSurfaceId = getSurfaceId(env);
@@ -291,7 +343,7 @@ export async function getTmuxPaneLabel(env: CmuxEnv = process.env, runner: Comma
 
 export class CmuxClient {
   private readonly supportedCommandsPromises = new Map<string, Promise<Set<string>>>();
-  private legacyStatusQueue: Promise<void> = Promise.resolve();
+  private optionalStatusQueue: Promise<void> = Promise.resolve();
 
   constructor(
     private readonly options: {
@@ -324,7 +376,7 @@ export class CmuxClient {
   }
 
   async setStatus(key: string, text: string, options?: CmuxStatusOptions): Promise<void> {
-    await this.enqueueLegacyStatus(async () => {
+    await this.enqueueStatus(async () => {
       const env = await this.getRuntimeEnv();
       if (await this.supportsCliCommand("set-status", env)) {
         await this.run(buildSetStatusArgs(key, text, options), env);
@@ -333,7 +385,7 @@ export class CmuxClient {
   }
 
   async clearStatus(key: string): Promise<void> {
-    await this.enqueueLegacyStatus(async () => {
+    await this.enqueueStatus(async () => {
       const env = await this.getRuntimeEnv();
       if (await this.supportsCliCommand("clear-status", env)) {
         await this.run(buildClearStatusArgs(key), env);
@@ -356,6 +408,10 @@ export class CmuxClient {
     return this.options.exists ?? existsSync;
   }
 
+  private get cliExists(): ExistsFn {
+    return this.options.exists ?? isExecutableFile;
+  }
+
   private get runner(): CommandRunner {
     return this.options.runner ?? execFileRunner;
   }
@@ -364,12 +420,12 @@ export class CmuxClient {
     return resolveRuntimeCmuxEnv(this.env, this.runner);
   }
 
-  private enqueueLegacyStatus(task: () => Promise<void>): Promise<void> {
-    const next = this.legacyStatusQueue.then(task, task);
-    this.legacyStatusQueue = next.catch(() => {
-      // Legacy status is best-effort; keep the queue alive after failures.
+  private enqueueStatus(task: () => Promise<void>): Promise<void> {
+    const next = this.optionalStatusQueue.then(task, task);
+    this.optionalStatusQueue = next.catch(() => {
+      // Sidebar status is best-effort; keep the queue alive after failures.
     });
-    return this.legacyStatusQueue;
+    return this.optionalStatusQueue;
   }
 
   private async supportsCliCommand(commandName: string, env: CmuxEnv): Promise<boolean> {
@@ -383,7 +439,7 @@ export class CmuxClient {
   }
 
   private getSupportedCliCommands(env: CmuxEnv): Promise<Set<string>> {
-    const cli = resolveCmuxCli(env, this.exists);
+    const cli = resolveCmuxCli(env, this.cliExists);
     let commands = this.supportedCommandsPromises.get(cli);
     if (!commands) {
       commands = this.readSupportedCliCommands(cli, env);
@@ -393,7 +449,7 @@ export class CmuxClient {
   }
 
   private async resolveSurfaceId(env: CmuxEnv): Promise<string | undefined> {
-    return resolveCmuxSurfaceId(env, this.exists, this.runner);
+    return resolveCmuxSurfaceId(env, this.cliExists, this.runner);
   }
 
   private async readSupportedCliCommands(cli: string, env: CmuxEnv): Promise<Set<string>> {
@@ -416,7 +472,7 @@ export class CmuxClient {
   private async run(args: string[], env: CmuxEnv): Promise<void> {
     if (!isInCmuxEnv(env, this.exists)) return;
     try {
-      await this.runner(resolveCmuxCli(env, this.exists), args, { env });
+      await this.runner(resolveCmuxCli(env, this.cliExists), args, { env });
     } catch {
       // cmux is best-effort; never let notification failures affect pi.
     }

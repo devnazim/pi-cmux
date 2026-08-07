@@ -84,17 +84,17 @@ export function registerPiCmuxExtension(
 ): void {
   const cmuxGlobal = globalThis as unknown as CmuxGlobal;
 
-  async function setPiStatus(text: string, options: typeof STATUS_WORKING, legacy: "await" | "background" = "background"): Promise<void> {
+  async function setPiStatus(text: string, options: typeof STATUS_WORKING, completion: "await" | "background" = "background"): Promise<void> {
     await cmux.reportShellState("running");
     const status = cmux.setStatus(STATUS_KEY, text, options);
-    if (legacy === "await") await status;
+    if (completion === "await") await status;
     else background(status);
   }
 
-  async function clearPiStatus(legacy: "await" | "background" = "background"): Promise<void> {
+  async function clearPiStatus(completion: "await" | "background" = "background"): Promise<void> {
     await cmux.reportShellState("prompt");
     const clear = cmux.clearStatus(STATUS_KEY);
-    if (legacy === "await") await clear;
+    if (completion === "await") await clear;
     else background(clear);
   }
 
