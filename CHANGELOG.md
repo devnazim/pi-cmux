@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.1
+
+### Fixed
+
+- Resolve missing relay surface IDs with workspace-scoped `surface.current` instead of `surface.list`. Reject failed, malformed, mismatched, or non-terminal results rather than moving lifecycle delivery to current focus.
+- Keep captured relay targets pinned across focus, workspace, and relay-port changes without attaching unrelated terminal lifecycle IDs.
+
 ## 0.2.0
 
 ### Upgrade notes

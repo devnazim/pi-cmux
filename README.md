@@ -69,7 +69,12 @@ For SSH/tmux/surface-aware notifications, it targets the active cmux surface by 
 - `CMUX_SURFACE_ID`
 - `CMUX_PANEL_ID`
 
-If neither is present but `CMUX_WORKSPACE_ID` or `CMUX_TAB_ID` exists, `pi-cmux` asks cmux for that workspace's surfaces with `surface.list` and chooses the focused surface, then the selected-in-pane surface, then the first surface.
+If neither is present but `CMUX_WORKSPACE_ID` or `CMUX_TAB_ID` exists, lookup depends on the connection:
+
+- Local connections use `surface.list` and choose the focused surface, then the selected-in-pane surface, then the first surface.
+- Relay connections use `surface.current` with an explicit `workspace_id`. `pi-cmux` accepts only a non-empty terminal surface whose returned `workspace_id` or `workspace_ref` matches the requested workspace. UUID comparisons ignore letter case. Failed commands, malformed responses, ownership mismatches, and non-terminal results leave the surface unresolved.
+
+Relay discovery is workspace-scoped and best-effort. Current cmux relay routing returns the first active remote terminal surface, or a mirrored tmux pane. It does not use the Mac's locally focused panel and cannot guarantee exact pane attribution when a workspace has several remote surfaces.
 
 Lifecycle delivery captures this target once per Pi session. Once a surface is resolved, later focus changes cannot send the completion to another terminal or leave the original terminal marked busy. Connection details still refresh before every call. A changed workspace does not silently replace the captured target. If the initial lookup cannot resolve a surface, lifecycle shell-state reports and popups are skipped instead of falling back to current focus. If cmux no longer accepts a captured target, delivery remains best-effort; reload Pi to resolve a new one. The optional notifier API resolves its target for each request.
 
@@ -79,7 +84,7 @@ Notifications use the relay-compatible scoped RPC:
 cmux rpc notification.create '{"workspace_id":"...","surface_id":"...","title":"..."}'
 ```
 
-`workspace_id` and `surface_id` are included when known. With no surface, the workspace scope is retained; with no routing context, local cmux resolves the notification from caller/focus context. Restricted remote relays require a valid workspace ID for notifications, but accept workspace-only popups when the surface cannot be resolved. `pi-cmux` does not use `notification.create_for_surface`, because current cmux documents that method as local-only and not relay-reachable.
+`workspace_id` and `surface_id` are included when known. With no surface, the workspace scope is retained for direct optional notification requests; captured lifecycle delivery skips the popup. With no routing context, local cmux resolves the notification from caller/focus context. Restricted remote relays require a valid workspace ID for notifications, but accept workspace-only popups when the surface cannot be resolved. `pi-cmux` does not use `notification.create_for_surface`, because current cmux documents that method as local-only and not relay-reachable.
 
 If `TMUX_PANE` is set, `pi-cmux` asks tmux for a readable pane label and prefixes notification bodies with it, e.g. `[dev:1 %2] Ready for input`. If tmux lookup fails, it falls back to the raw pane id.
 
@@ -169,4 +174,4 @@ npm test
 npm run check
 ```
 
-The implementation no-ops outside cmux, scopes relay-safe notifications and shell-state reports to the active workspace/surface when possible, waits for Pi's fully settled lifecycle state, infers SSH/tmux surfaces with `surface.list`, adds tmux pane labels and Pi session names for disambiguation, probes optional commands before using them, keeps sidebar status calls best-effort in the background, and executes commands without shell interpolation.
+The implementation no-ops outside cmux, scopes relay-safe notifications and shell-state reports to the active workspace/surface when possible, waits for Pi's fully settled lifecycle state, resolves SSH/tmux surfaces with workspace-scoped lookup, adds tmux pane labels and Pi session names for disambiguation, probes optional commands before using them, keeps sidebar status calls best-effort in the background, and executes commands without shell interpolation.

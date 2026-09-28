@@ -14,6 +14,7 @@ import {
   parseTmuxEnvironmentOutput,
   pickBestSurfaceId,
   resolveCmuxCli,
+  resolveCmuxSurfaceId,
   type CommandRunner,
 } from "../src/cmux.js";
 
@@ -218,6 +219,109 @@ test("selects current cmux focused and selected-in-pane surface fields", () => {
   );
 });
 
+test("surface resolver uses workspace-scoped relay lookup and keeps local selection", async () => {
+  const relayCalls: Array<readonly string[]> = [];
+  const workspaceId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const relaySurfaceId = await resolveCmuxSurfaceId(
+    { CMUX_WORKSPACE_ID: workspaceId, CMUX_SOCKET_PATH: "127.0.0.1:60000" },
+    () => false,
+    async (_command, args) => {
+      relayCalls.push(args);
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          workspace_id: workspaceId.toUpperCase(),
+          workspace_ref: "workspace:1",
+          surface_id: "11111111-2222-4333-8444-555555555555",
+          surface_ref: "surface:1",
+          pane_id: "66666666-7777-4888-8999-aaaaaaaaaaaa",
+          surface_type: "terminal",
+        }),
+        stderr: "",
+      };
+    },
+  );
+
+  assert.equal(relaySurfaceId, "11111111-2222-4333-8444-555555555555");
+  assert.deepEqual(relayCalls[0].slice(0, 2), ["rpc", "surface.current"]);
+  assert.deepEqual(JSON.parse(relayCalls[0][2]), { workspace_id: workspaceId });
+
+  const refSurfaceId = await resolveCmuxSurfaceId(
+    { CMUX_WORKSPACE_ID: "workspace:7", CMUX_SOCKET_PATH: "localhost:60000" },
+    () => false,
+    async () => ({
+      exitCode: 0,
+      stdout: JSON.stringify({
+        workspace_id: "bbbbbbbb-cccc-4ddd-8eee-ffffffffffff",
+        workspace_ref: "workspace:7",
+        surface_id: "surface:7",
+        surface_ref: "surface:7-ref",
+        pane_id: "pane:7",
+        surface_type: "terminal",
+      }),
+      stderr: "",
+    }),
+  );
+  assert.equal(refSurfaceId, "surface:7");
+
+  const localCalls: Array<readonly string[]> = [];
+  const localSurfaceId = await resolveCmuxSurfaceId(
+    { CMUX_WORKSPACE_ID: "workspace:local", CMUX_SOCKET_PATH: "/tmp/cmux.sock" },
+    () => false,
+    async (_command, args) => {
+      localCalls.push(args);
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({ surfaces: [{ id: "surface:first" }, { id: "surface:focused", focused: true }] }),
+        stderr: "",
+      };
+    },
+  );
+  assert.equal(localSurfaceId, "surface:focused");
+  assert.deepEqual(localCalls[0].slice(0, 2), ["rpc", "surface.list"]);
+});
+
+test("surface resolver rejects unsafe relay responses and skips explicit lookup", async (t) => {
+  const workspaceId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const cases: Array<{ name: string; result: { exitCode: number; stdout: string; stderr: string } }> = [
+    { name: "command failure", result: { exitCode: 7, stdout: "", stderr: "failed" } },
+    { name: "invalid JSON", result: { exitCode: 0, stdout: "not json", stderr: "" } },
+    { name: "non-object response", result: { exitCode: 0, stdout: "[]", stderr: "" } },
+    { name: "missing workspace ownership", result: { exitCode: 0, stdout: JSON.stringify({ surface_id: "surface:1", surface_type: "terminal" }), stderr: "" } },
+    { name: "mismatched workspace", result: { exitCode: 0, stdout: JSON.stringify({ workspace_id: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb", surface_id: "surface:1", surface_type: "terminal" }), stderr: "" } },
+    { name: "empty surface", result: { exitCode: 0, stdout: JSON.stringify({ workspace_id: workspaceId, surface_id: "  ", surface_type: "terminal" }), stderr: "" } },
+    { name: "missing surface type", result: { exitCode: 0, stdout: JSON.stringify({ workspace_id: workspaceId, surface_id: "surface:1" }), stderr: "" } },
+    { name: "non-terminal surface", result: { exitCode: 0, stdout: JSON.stringify({ workspace_id: workspaceId, surface_id: "surface:1", surface_type: "browser" }), stderr: "" } },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      let calls = 0;
+      const surfaceId = await resolveCmuxSurfaceId(
+        { CMUX_WORKSPACE_ID: workspaceId, CMUX_SOCKET_PATH: "127.0.0.1:60000" },
+        () => false,
+        async () => {
+          calls++;
+          return entry.result;
+        },
+      );
+      assert.equal(surfaceId, undefined);
+      assert.equal(calls, 1);
+    });
+  }
+
+  let calls = 0;
+  assert.equal(await resolveCmuxSurfaceId(
+    { CMUX_WORKSPACE_ID: workspaceId, CMUX_SURFACE_ID: "surface:explicit", CMUX_SOCKET_PATH: "127.0.0.1:60000" },
+    () => false,
+    async () => {
+      calls++;
+      return { exitCode: 1, stdout: "", stderr: "unexpected" };
+    },
+  ), "surface:explicit");
+  assert.equal(calls, 0);
+});
+
 test("client refreshes shared cmux env from tmux and resolves its surface", async () => {
   const calls: Array<{
     command: string;
@@ -250,10 +354,17 @@ test("client refreshes shared cmux env from tmux and resolves its surface", asyn
       socketCapability: options?.env?.CMUX_SOCKET_CAPABILITY,
       socketPassword: options?.env?.CMUX_SOCKET_PASSWORD,
     });
-    if (args[1] === "surface.list") {
+    if (args[1] === "surface.current") {
       return {
         exitCode: 0,
-        stdout: JSON.stringify({ surfaces: [{ id: "surface:new", selected_in_pane: true }] }),
+        stdout: JSON.stringify({
+          workspace_id: "workspace:new",
+          workspace_ref: "workspace:1",
+          surface_id: "surface:new",
+          surface_ref: "surface:1",
+          pane_id: "pane:new",
+          surface_type: "terminal",
+        }),
         stderr: "",
       };
     }
@@ -278,7 +389,7 @@ test("client refreshes shared cmux env from tmux and resolves its surface", asyn
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:60000", "127.0.0.1:60000"]);
   assert.deepEqual(calls.map(({ socketCapability }) => socketCapability), ["process-capability", "process-capability"]);
   assert.deepEqual(calls.map(({ socketPassword }) => socketPassword), ["process-password", "process-password"]);
-  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.list"]);
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.current"]);
   assert.deepEqual(JSON.parse(calls[0].args[2]), { workspace_id: "workspace:new" });
   assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create"]);
   assert.deepEqual(JSON.parse(calls[1].args[2]), {
@@ -299,10 +410,17 @@ test("client preserves inherited shared cmux values when tmux refresh is partial
     }
 
     calls.push({ args, socketPath: options?.env?.CMUX_SOCKET_PATH });
-    if (args[1] === "surface.list") {
+    if (args[1] === "surface.current") {
       return {
         exitCode: 0,
-        stdout: JSON.stringify({ surfaces: [{ id: "surface:resolved", selected_in_pane: true }] }),
+        stdout: JSON.stringify({
+          workspace_id: "workspace:old",
+          workspace_ref: "workspace:1",
+          surface_id: "surface:resolved",
+          surface_ref: "surface:1",
+          pane_id: "pane:resolved",
+          surface_type: "terminal",
+        }),
         stderr: "",
       };
     }
@@ -322,7 +440,7 @@ test("client preserves inherited shared cmux values when tmux refresh is partial
 
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:60000", "127.0.0.1:60000"]);
-  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.list"]);
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.current"]);
   assert.deepEqual(JSON.parse(calls[0].args[2]), { workspace_id: "workspace:old" });
   assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create"]);
   assert.deepEqual(JSON.parse(calls[1].args[2]), {
@@ -385,7 +503,7 @@ test("client preserves inherited shared cmux env when tmux omits values", async 
 
   assert.equal(calls.length, 2);
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:50000", "127.0.0.1:50000"]);
-  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.list", "notification.create"]);
+  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.current", "notification.create"]);
   assert.deepEqual(JSON.parse(calls[1].args[2]), { title: "Done", workspace_id: "workspace:old" });
 });
 
@@ -504,7 +622,7 @@ test("client skips unresolved relay shell state but still sends workspace notifi
   const calls: Array<readonly string[]> = [];
   const runner: CommandRunner = async (_command, args) => {
     calls.push(args);
-    if (args[1] === "surface.list") return { exitCode: 1, stdout: "", stderr: "unavailable" };
+    if (args[1] === "surface.current") return { exitCode: 1, stdout: "", stderr: "unavailable" };
     return { exitCode: 0, stdout: "", stderr: "" };
   };
   const client = new CmuxClient({
@@ -514,9 +632,9 @@ test("client skips unresolved relay shell state but still sends workspace notifi
   });
 
   await client.reportShellState("running");
-  assert.deepEqual(calls.map((args) => args[1]), ["surface.list"]);
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.current"]);
   await client.notify({ title: "Done" });
-  assert.deepEqual(calls.map((args) => args[1]), ["surface.list", "surface.list", "notification.create"]);
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.current", "surface.current", "notification.create"]);
   assert.deepEqual(JSON.parse(calls[2][2]), { title: "Done", workspace_id: "workspace:1" });
 });
 
@@ -528,13 +646,17 @@ test("client omits a refreshed tmux lifecycle when another terminal has focus", 
       return { exitCode: 0, stdout: `CMUX_TERMINAL_LIFECYCLE_ID=${lifecycleId}\nCMUX_SOCKET_PATH=127.0.0.1:60000`, stderr: "" };
     }
     calls.push(args);
-    if (args[1] === "surface.list") {
+    if (args[1] === "surface.current") {
       return {
         exitCode: 0,
-        stdout: JSON.stringify({ surfaces: [
-          { id: "surface:reporter", selected_in_pane: true },
-          { id: "surface:focused", focused: true },
-        ] }),
+        stdout: JSON.stringify({
+          workspace_id: "workspace:1",
+          workspace_ref: "workspace:1-ref",
+          surface_id: "surface:focused",
+          surface_ref: "surface:1",
+          pane_id: "pane:focused",
+          surface_type: "terminal",
+        }),
         stderr: "",
       };
     }
@@ -551,7 +673,7 @@ test("client omits a refreshed tmux lifecycle when another terminal has focus", 
     runner,
   }).reportShellState("running");
 
-  assert.deepEqual(calls.map((args) => args[1]), ["surface.list", "surface.report_shell_state"]);
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.current", "surface.report_shell_state"]);
   assert.deepEqual(JSON.parse(calls[1][2]), {
     workspace_id: "workspace:1",
     surface_id: "surface:focused",
@@ -559,7 +681,7 @@ test("client omits a refreshed tmux lifecycle when another terminal has focus", 
   });
 });
 
-test("client prefers explicit surface env and does not call surface.list", async () => {
+test("client prefers explicit surface env and does not perform surface lookup", async () => {
   const calls: Array<readonly string[]> = [];
   const runner: CommandRunner = async (_command, args) => {
     calls.push(args);
@@ -759,8 +881,19 @@ test("captured tmux target survives focus, workspace and relay-port changes", as
       return { exitCode: 0, stdout: `CMUX_WORKSPACE_ID=${workspaceId}\nCMUX_SOCKET_PATH=${socketPath}\nCMUX_TERMINAL_LIFECYCLE_ID=unrelated`, stderr: "" };
     }
     calls.push({ args, socketPath: options?.env?.CMUX_SOCKET_PATH });
-    if (args[1] === "surface.list") {
-      return { exitCode: 0, stdout: JSON.stringify({ surfaces: [{ id: surfaceId, focused: true }] }), stderr: "" };
+    if (args[1] === "surface.current") {
+      return {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          workspace_id: workspaceId,
+          workspace_ref: "workspace:1",
+          surface_id: surfaceId,
+          surface_ref: "surface:1",
+          pane_id: "pane:1",
+          surface_type: "terminal",
+        }),
+        stderr: "",
+      };
     }
     return { exitCode: 0, stdout: "", stderr: "" };
   };
@@ -772,7 +905,7 @@ test("captured tmux target survives focus, workspace and relay-port changes", as
   socketPath = "127.0.0.1:60000";
   await client.reportShellState("prompt", target);
   await client.notify({ title: "Done" }, target);
-  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.list", "surface.report_shell_state", "surface.report_shell_state", "notification.create"]);
+  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.current", "surface.report_shell_state", "surface.report_shell_state", "notification.create"]);
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:50000", "127.0.0.1:50000", "127.0.0.1:60000", "127.0.0.1:60000"]);
   for (const { args } of calls.slice(1)) {
     const payload = JSON.parse(args[2]);
@@ -824,6 +957,72 @@ test("incomplete captured targets cannot write unowned sidebar entries", async (
   assert.deepEqual(calls, []);
 });
 
+test("client rejects unsafe relay targets and records lookup failures", async (t) => {
+  const workspaceId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
+  const cases: Array<{
+    name: string;
+    result: { exitCode: number; stdout: string; stderr: string };
+    failure?: { operation: string; exitCode: number };
+  }> = [
+    {
+      name: "command failure",
+      result: { exitCode: 7, stdout: "", stderr: "failed" },
+      failure: { operation: "rpc surface.current", exitCode: 7 },
+    },
+    {
+      name: "JSON parse failure",
+      result: { exitCode: 0, stdout: "not json", stderr: "" },
+      failure: { operation: "rpc surface.current", exitCode: 1 },
+    },
+    {
+      name: "mismatched workspace",
+      result: {
+        exitCode: 0,
+        stdout: JSON.stringify({
+          workspace_id: "ffffffff-eeee-4ddd-8ccc-bbbbbbbbbbbb",
+          workspace_ref: "workspace:9",
+          surface_id: "surface:other",
+          surface_type: "terminal",
+        }),
+        stderr: "",
+      },
+    },
+    {
+      name: "missing surface type",
+      result: { exitCode: 0, stdout: JSON.stringify({ workspace_id: workspaceId, surface_id: "surface:1" }), stderr: "" },
+    },
+    {
+      name: "non-terminal surface",
+      result: {
+        exitCode: 0,
+        stdout: JSON.stringify({ workspace_id: workspaceId, surface_id: "surface:1", surface_type: "browser" }),
+        stderr: "",
+      },
+    },
+  ];
+
+  for (const entry of cases) {
+    await t.test(entry.name, async () => {
+      const calls: Array<readonly string[]> = [];
+      const client = new CmuxClient({
+        env: { CMUX_WORKSPACE_ID: workspaceId, CMUX_SOCKET_PATH: "127.0.0.1:60000" },
+        exists: () => false,
+        runner: async (_command, args) => {
+          calls.push(args);
+          return entry.result;
+        },
+      });
+      const target = await client.captureTarget();
+      assert.equal(target.workspaceId, workspaceId);
+      assert.equal(target.surfaceId, undefined);
+      assert.equal(await client.reportShellState("running", target), false);
+      await client.notify({ title: "Done" }, target);
+      assert.deepEqual(calls.map((args) => args[1]), ["surface.current"]);
+      assert.deepEqual((await client.getDiagnostics(target)).recentFailures, entry.failure ? [entry.failure] : []);
+    });
+  }
+});
+
 test("an unresolved captured target never falls back to focus on local or relay connections", async () => {
   for (const socketPath of ["/tmp/cmux.sock", "localhost:60000"]) {
     const calls: Array<readonly string[]> = [];
@@ -839,7 +1038,7 @@ test("an unresolved captured target never falls back to focus on local or relay 
     assert.equal(await client.reportShellState("running", target), false);
     assert.equal(await client.reportShellState("prompt", target), false);
     await client.notify({ title: "Done" }, target);
-    assert.deepEqual(calls.map((args) => args[1]), ["surface.list"]);
+    assert.deepEqual(calls.map((args) => args[1]), [socketPath.startsWith("localhost") ? "surface.current" : "surface.list"]);
   }
 });
 

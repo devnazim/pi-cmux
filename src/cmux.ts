@@ -220,8 +220,31 @@ export function parseSurfaceListOutput(output: string): string | undefined {
   return pickBestSurfaceId(JSON.parse(output));
 }
 
+function workspaceMatches(value: unknown, requestedWorkspaceId: string): boolean {
+  if (typeof value !== "string") return false;
+  const workspaceId = nonEmpty(value);
+  if (!workspaceId) return false;
+  if (workspaceId === requestedWorkspaceId) return true;
+
+  const uuidPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  return uuidPattern.test(workspaceId) &&
+    uuidPattern.test(requestedWorkspaceId) &&
+    workspaceId.toLowerCase() === requestedWorkspaceId.toLowerCase();
+}
+
+function parseCurrentSurfaceOutput(output: string, workspaceId: string): string | undefined {
+  const result: unknown = JSON.parse(output);
+  if (!isRecord(result) || result.surface_type !== "terminal") return undefined;
+  if (!workspaceMatches(result.workspace_id, workspaceId) && !workspaceMatches(result.workspace_ref, workspaceId)) return undefined;
+  return typeof result.surface_id === "string" ? nonEmpty(result.surface_id) : undefined;
+}
+
 export function buildSurfaceListArgs(workspaceId: string): string[] {
   return ["rpc", "surface.list", JSON.stringify({ workspace_id: workspaceId })];
+}
+
+export function buildSurfaceCurrentArgs(workspaceId: string): string[] {
+  return ["rpc", "surface.current", JSON.stringify({ workspace_id: workspaceId })];
 }
 
 export function normalizeLogLevel(level: PiCmuxLogLevel | undefined): string | undefined {
@@ -350,10 +373,12 @@ export async function resolveCmuxSurfaceId(
   const workspaceId = getWorkspaceId(env);
   if (!workspaceId) return undefined;
 
+  const relay = isRemoteRelay(env);
+  const args = relay ? buildSurfaceCurrentArgs(workspaceId) : buildSurfaceListArgs(workspaceId);
   try {
-    const result = await runner(resolveCmuxCli(env, exists), buildSurfaceListArgs(workspaceId), { env });
+    const result = await runner(resolveCmuxCli(env, exists), args, { env });
     if (result.exitCode !== 0) return undefined;
-    return parseSurfaceListOutput(result.stdout);
+    return relay ? parseCurrentSurfaceOutput(result.stdout, workspaceId) : parseSurfaceListOutput(result.stdout);
   } catch {
     return undefined;
   }
@@ -556,12 +581,16 @@ export class CmuxClient {
     if (explicitSurfaceId) return explicitSurfaceId;
     const workspaceId = getWorkspaceId(env);
     if (!workspaceId) return undefined;
-    const result = await this.execute(resolveCmuxCli(env, this.cliExists), buildSurfaceListArgs(workspaceId), env);
+    // Remote cmux's tmux integration uses this workspace-scoped lookup too.
+    // Some relay/app versions fail surface.list despite accepting surface.current.
+    const relay = isRemoteRelay(env);
+    const args = relay ? buildSurfaceCurrentArgs(workspaceId) : buildSurfaceListArgs(workspaceId);
+    const result = await this.execute(resolveCmuxCli(env, this.cliExists), args, env);
     if (result.exitCode !== 0) return undefined;
     try {
-      return parseSurfaceListOutput(result.stdout);
+      return relay ? parseCurrentSurfaceOutput(result.stdout, workspaceId) : parseSurfaceListOutput(result.stdout);
     } catch {
-      this.recordFailure("rpc surface.list", 1);
+      this.recordFailure(`rpc ${args[1]}`, 1);
       return undefined;
     }
   }
