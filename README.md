@@ -4,11 +4,11 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 `pi-cmux` is a standalone pi extension/package. It sends generic pi lifecycle updates to cmux and exposes an optional in-process notifier API that other pi extensions can use for semantic notifications.
 
-Package name: `@devnazim/pi-cmux`.
+Package name: `@devnazim/pi-cmux`. See [release notes](CHANGELOG.md).
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.84.1. Its cmux integration is checked against the v0.64.22 CLI/RPC contract. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.87.1. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
 
-Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Do not enable both lifecycle integrations unless you intentionally want duplicate completion notifications. `pi-cmux` remains useful when you want this package's configuration or its cross-extension notifier API.
+Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion notifications.
 
 ## Install
 
@@ -36,11 +36,21 @@ pi -e /path/to/pi-cmux
 | --- | --- |
 | Agent starts | report the cmux workspace/surface as running (`surface.report_shell_state`) |
 | Agent run ends with queued messages | keep/report the workspace/surface as running |
-| Agent fully settles | desktop notification (including session name when set) + report prompt/idle |
-| Session shuts down/reloads | report prompt/idle |
+| Agent settles successfully | completion notification with session name + report prompt/idle |
+| Agent settles after failure | error notification + error log + report prompt/idle |
+| Agent settles after cancellation | report prompt/idle without a completion popup |
+| Blocking Pi UI prompt opens | at most one "Pi needs input" popup per observed waiting episode |
+| Blocking Pi UI prompt closes | cancel any pending input-wait popup |
+| Session shuts down/reloads | discard queued deliveries and clear owned activity/status |
 | Optional extension notification | popup/status/log best-effort, controlled by the caller |
 
-All cmux calls are best-effort. If cmux is unavailable or a command fails, pi continues normally.
+All cmux calls are best-effort. Lifecycle handlers enqueue delivery without waiting for cmux, so a slow CLI does not delay agent startup or settlement. The queue preserves report order. A new run cancels obsolete completion delivery. Shutdown waits for in-flight delivery and owned cleanup, but discards pending notifications. Failed cleanup remains owned so shutdown can retry it. Each subprocess has a three-second timeout.
+
+Each Pi session uses its own sidebar status key, registered with its local process PID and captured panel. Finishing one session does not clear another session's sidebar entry. cmux can remove owned entries after the process exits or the panel closes. Failed clears from retired sessions remain in a process-local retry list across extension reloads and retry on later session/start events.
+
+Aborted runs do not generate success popups; failed runs use `notifications.error`, independently of `notifications.done`. Automatic completion and input-wait popups are disabled outside TUI mode unless `notifications.headless` is enabled. Activity reporting and logs are unaffected by this popup guard.
+
+Input-wait alerts cover blocking `ctx.ui` dialogs, not assistant text asking a question. They use a generic body, without dialog titles, contents, or answers. Closing a prompt cancels a queued or in-flight delivery where possible; an already-delivered desktop notification cannot be withdrawn. Alerts follow Pi's delivered prompt events. Delayed handlers in other extensions can cause separate waiting episodes to be grouped together.
 
 ## cmux, SSH, and tmux behavior
 
@@ -61,13 +71,15 @@ For SSH/tmux/surface-aware notifications, it targets the active cmux surface by 
 
 If neither is present but `CMUX_WORKSPACE_ID` or `CMUX_TAB_ID` exists, `pi-cmux` asks cmux for that workspace's surfaces with `surface.list` and chooses the focused surface, then the selected-in-pane surface, then the first surface.
 
+Lifecycle delivery captures this target once per Pi session. Once a surface is resolved, later focus changes cannot send the completion to another terminal or leave the original terminal marked busy. Connection details still refresh before every call. A changed workspace does not silently replace the captured target. If the initial lookup cannot resolve a surface, lifecycle shell-state reports and popups are skipped instead of falling back to current focus. If cmux no longer accepts a captured target, delivery remains best-effort; reload Pi to resolve a new one. The optional notifier API resolves its target for each request.
+
 Notifications use the relay-compatible scoped RPC:
 
 ```text
 cmux rpc notification.create '{"workspace_id":"...","surface_id":"...","title":"..."}'
 ```
 
-`workspace_id` and `surface_id` are included when known. With no surface, the workspace scope is retained; with no routing context, local cmux resolves the notification from caller/focus context. Restricted remote relays require both valid IDs, so a remote popup remains best-effort if the active surface cannot be resolved. `pi-cmux` does not use `notification.create_for_surface`, because current cmux documents that method as local-only and not relay-reachable.
+`workspace_id` and `surface_id` are included when known. With no surface, the workspace scope is retained; with no routing context, local cmux resolves the notification from caller/focus context. Restricted remote relays require a valid workspace ID for notifications, but accept workspace-only popups when the surface cannot be resolved. `pi-cmux` does not use `notification.create_for_surface`, because current cmux documents that method as local-only and not relay-reachable.
 
 If `TMUX_PANE` is set, `pi-cmux` asks tmux for a readable pane label and prefixes notification bodies with it, e.g. `[dev:1 %2] Ready for input`. If tmux lookup fails, it falls back to the raw pane id.
 
@@ -75,7 +87,7 @@ When running inside tmux, `pi-cmux` also refreshes cmux's managed shared environ
 
 This avoids terminal OSC notifications and works through SSH/tmux when the cmux shell integration exposes the needed env/socket/CLI access in the remote environment. Without that cmux environment, the extension silently no-ops.
 
-Current cmux builds expose notification and shell-state RPCs as well as the top-level `set-status`, `clear-status`, and `log` commands. `pi-cmux` uses the shell-state RPC for lifecycle activity, including workspace-only reports when no surface can be resolved. It still probes `cmux --help` before optional sidebar status/log calls so older installations remain best-effort compatible, and keeps those calls off the critical agent lifecycle path.
+Current cmux builds expose notification and shell-state RPCs as well as the top-level `set-status`, `clear-status`, and `log` commands. `pi-cmux` uses the shell-state RPC for lifecycle activity with the captured surface ID. Reports include `CMUX_TERMINAL_LIFECYCLE_ID` only when both the surface and lifecycle ID still match the explicit runtime environment. Inferred surfaces, including those resolved after tmux refresh, omit it because the lifecycle ID may belong to another terminal. Local connections probe `cmux --help` before optional sidebar status/log calls. Successful probes are cached per executable; failed probes retry on a later call. Restricted remote relays do not accept the legacy sidebar protocol, so the extension skips `set-status`, `clear-status`, and `log` on those transports. Notification and shell-state RPCs remain available.
 
 ## Configuration
 
@@ -83,10 +95,13 @@ Create `~/.config/pi-cmux/config.json` or set `PI_CMUX_CONFIG` to another path.
 
 ```json
 {
+  "lifecycle": true,
   "notifications": {
     "done": true,
     "error": true,
-    "xplan": true
+    "xplan": true,
+    "input": true,
+    "headless": false
   },
   "status": true,
   "logs": true
@@ -95,13 +110,24 @@ Create `~/.config/pi-cmux/config.json` or set `PI_CMUX_CONFIG` to another path.
 
 | Option | Default | Description |
 | --- | --- | --- |
-| `notifications.done` | `true` | Show generic “Pi done” notifications. |
-| `notifications.error` | `true` | Allow error-level popup notifications from optional callers. |
+| `lifecycle` | `true` | Enable automatic activity, completion, and input-wait integration. Set `false` for notifier-only mode. |
+| `notifications.done` | `true` | Show successful-run "Pi done" notifications. |
+| `notifications.error` | `true` | Show failed-run notifications and allow error-level popups from optional callers. |
 | `notifications.xplan` | `true` | Allow popup notifications from `source: "xplan"`. |
+| `notifications.input` | `true` | Show automatic popups for blocking Pi UI prompts. |
+| `notifications.headless` | `false` | Allow automatic completion and input-wait popups outside TUI mode. |
 | `status` | `true` | Report cmux workspace/surface activity, and allow supported optional status commands. |
-| `logs` | `true` | Write cmux log entries when the installed cmux CLI exposes `cmux log`; otherwise no-op. |
+| `logs` | `true` | Write cmux log entries when the local CLI exposes `cmux log`; skip restricted relays. |
 
-Malformed or omitted values fall back to defaults.
+Malformed or omitted values fall back to defaults. Reload Pi after changing the file. These options do not change or install cmux's own hooks.
+
+With `lifecycle: false`, explicit notifier requests still follow `status`, `logs`, and the relevant notification filters. Explicit requests are not blocked by `notifications.headless`; callers control whether to send them. Cleanup already owed by retired sessions can still retry.
+
+## Diagnostics
+
+Run `/cmux-status` in Pi to inspect detection, CLI path, local or relay transport, workspace/surface target, optional command support, configuration, and pending retired-status cleanup count. It also shows up to five recent cmux failures as operation names and exit codes. Failed capability probes appear as `null`; unsupported commands appear as an empty list.
+
+The command does not send a desktop notification. It excludes credentials, notification contents, and raw subprocess output. It does not enable cmux's first-party hooks or change configuration.
 
 ## Optional notifier API
 

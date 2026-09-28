@@ -24,10 +24,13 @@ export interface PiCmuxNotification {
 }
 
 export interface PiCmuxConfig {
+  lifecycle: boolean;
   notifications: {
     done: boolean;
     error: boolean;
     xplan: boolean;
+    input: boolean;
+    headless: boolean;
   };
   status: boolean;
   logs: boolean;

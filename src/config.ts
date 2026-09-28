@@ -5,10 +5,13 @@ import { join } from "node:path";
 import type { PiCmuxConfig } from "./types.js";
 
 export const DEFAULT_CONFIG: PiCmuxConfig = {
+  lifecycle: true,
   notifications: {
     done: true,
     error: true,
     xplan: true,
+    input: true,
+    headless: false,
   },
   status: true,
   logs: true,
@@ -32,10 +35,13 @@ export function normalizeConfig(input: unknown): PiCmuxConfig {
 
   const notifications = isRecord(input.notifications) ? input.notifications : {};
   return {
+    lifecycle: booleanOrDefault(input.lifecycle, DEFAULT_CONFIG.lifecycle),
     notifications: {
       done: booleanOrDefault(notifications.done, DEFAULT_CONFIG.notifications.done),
       error: booleanOrDefault(notifications.error, DEFAULT_CONFIG.notifications.error),
       xplan: booleanOrDefault(notifications.xplan, DEFAULT_CONFIG.notifications.xplan),
+      input: booleanOrDefault(notifications.input, DEFAULT_CONFIG.notifications.input),
+      headless: booleanOrDefault(notifications.headless, DEFAULT_CONFIG.notifications.headless),
     },
     status: booleanOrDefault(input.status, DEFAULT_CONFIG.status),
     logs: booleanOrDefault(input.logs, DEFAULT_CONFIG.logs),
