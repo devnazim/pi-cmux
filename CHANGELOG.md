@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Compatibility
+
+- Updated the Pi development dependency to 1.0.0 and Node 24 types to 24.19.1.
+- Tested against Pi 1.0.0. The minimum supported Pi version remains 0.80.4.
+- Added an offline compatibility test using Pi's real extension loader and event runner for lifecycle notifications, input prompts, and shutdown.
+
 ## 0.2.1
 
 ### Fixed

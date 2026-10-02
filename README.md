@@ -6,7 +6,7 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`. See [release notes](CHANGELOG.md).
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 0.87.1. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.0. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
 
 Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion notifications.
 
