@@ -6,9 +6,15 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`. See [release notes](CHANGELOG.md).
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.0. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.2. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
 
 Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion notifications.
+
+## pi-agent-suite compatibility
+
+The integration was source-reviewed against `pi-agent-suite` 2.13.5, but both packages have not been runtime-tested together. The suite includes its own enabled-by-default cmux completion notifier. To keep `pi-cmux`'s settled-run notifications without duplicate success popups, disable the suite's cmux notifier with `"enabled": false` in its `cmux/config.json`. Alternatively, set `"lifecycle": false` in `pi-cmux` to retain only its optional notifier API and diagnostics.
+
+Suite 2.13.5 lets subagents load discovered extensions by default. If a subagent loads `pi-cmux`, headless completion popups stay disabled by default, but activity reports and logs can still affect the parent's cmux surface. Use the suite's `agent-selection/config.json` setting `subagents.extensions.mode` of `"none"`, or `"explicit"` with an `include` list that omits `pi-cmux`, when child sessions should not report cmux activity. These are configuration recommendations; this package does not change suite settings.
 
 ## Install
 

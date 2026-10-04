@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+### Compatibility
+
+- Updated the Pi development dependency and related Pi packages to 1.0.2. The minimum supported Pi version remains 0.80.4.
+- All 97 tests and the TypeScript check pass against Pi 1.0.2, including the offline real-loader and lifecycle test.
+- Source-reviewed pi-agent-suite 2.13.5 and documented its duplicate cmux notifier and default subagent extension loading. Combined-package runtime behavior has not been tested.
+
 ## 0.2.2
 
 ### Compatibility
