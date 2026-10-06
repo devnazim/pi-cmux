@@ -6,9 +6,9 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`. See [release notes](CHANGELOG.md).
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.2. Its cmux integration is checked against the [v0.64.25 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.64.25). It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.4. Its cmux integration is source-checked against the [v0.65.0 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.65.0), with mocked transport regression tests. Live cmux behavior has not been tested. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
 
-Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion notifications.
+Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion and input-wait notifications.
 
 ## pi-agent-suite compatibility
 
@@ -50,7 +50,7 @@ pi -e /path/to/pi-cmux
 | Session shuts down/reloads | discard queued deliveries and clear owned activity/status |
 | Optional extension notification | popup/status/log best-effort, controlled by the caller |
 
-All cmux calls are best-effort. Lifecycle handlers enqueue delivery without waiting for cmux, so a slow CLI does not delay agent startup or settlement. The queue preserves report order. A new run cancels obsolete completion delivery. Shutdown waits for in-flight delivery and owned cleanup, but discards pending notifications. Failed cleanup remains owned so shutdown can retry it. Each subprocess has a three-second timeout.
+All cmux calls are best-effort. Lifecycle handlers enqueue delivery without waiting for cmux, so a slow CLI does not delay agent startup or settlement. The queue preserves report order. A new run cancels obsolete completion delivery. Shutdown waits for in-flight delivery and owned cleanup, but discards pending notifications. Failed cleanup remains owned so shutdown can retry it. Abrupt process exits, including Pi's dead-terminal emergency exit, can skip extension shutdown. Each subprocess has a three-second timeout.
 
 Each Pi session uses its own sidebar status key, registered with its local process PID and captured panel. Finishing one session does not clear another session's sidebar entry. cmux can remove owned entries after the process exits or the panel closes. Failed clears from retired sessions remain in a process-local retry list across extension reloads and retry on later session/start events.
 
@@ -84,13 +84,15 @@ Relay discovery is workspace-scoped and best-effort. Current cmux relay routing 
 
 Lifecycle delivery captures this target once per Pi session. Once a surface is resolved, later focus changes cannot send the completion to another terminal or leave the original terminal marked busy. Connection details still refresh before every call. A changed workspace does not silently replace the captured target. If the initial lookup cannot resolve a surface, lifecycle shell-state reports and popups are skipped instead of falling back to current focus. If cmux no longer accepts a captured target, delivery remains best-effort; reload Pi to resolve a new one. The optional notifier API resolves its target for each request.
 
-Notifications use the relay-compatible scoped RPC:
+SSH relay notifications use the targeted RPC required by cmux v0.65.0:
 
 ```text
-cmux rpc notification.create '{"workspace_id":"...","surface_id":"...","title":"..."}'
+cmux rpc notification.create_for_target '{"workspace_id":"...","surface_id":"...","title":"..."}'
 ```
 
-`workspace_id` and `surface_id` are included when known. With no surface, the workspace scope is retained for direct optional notification requests; captured lifecycle delivery skips the popup. With no routing context, local cmux resolves the notification from caller/focus context. Restricted remote relays require a valid workspace ID for notifications, but accept workspace-only popups when the surface cannot be resolved. `pi-cmux` does not use `notification.create_for_surface`, because current cmux documents that method as local-only and not relay-reachable.
+Both workspace and surface IDs are required. If either is unresolved, relay popups are skipped, including direct optional notification requests. Relay requests never fall back to `notification.create`, which cmux v0.65.0 rejects even with both IDs present.
+
+Local notifications continue to use `notification.create`, including workspace and surface IDs when known. With no surface, the workspace scope is retained for direct optional notification requests; captured lifecycle delivery skips the popup. With no routing context, local cmux resolves the notification from caller/focus context. `pi-cmux` does not use the local-only `notification.create_for_surface` method.
 
 If `TMUX_PANE` is set, `pi-cmux` asks tmux for a readable pane label and prefixes notification bodies with it, e.g. `[dev:1 %2] Ready for input`. If tmux lookup fails, it falls back to the raw pane id.
 
@@ -98,7 +100,7 @@ When running inside tmux, `pi-cmux` also refreshes cmux's managed shared environ
 
 This avoids terminal OSC notifications and works through SSH/tmux when the cmux shell integration exposes the needed env/socket/CLI access in the remote environment. Without that cmux environment, the extension silently no-ops.
 
-Current cmux builds expose notification and shell-state RPCs as well as the top-level `set-status`, `clear-status`, and `log` commands. `pi-cmux` uses the shell-state RPC for lifecycle activity with the captured surface ID. Reports include `CMUX_TERMINAL_LIFECYCLE_ID` only when both the surface and lifecycle ID still match the explicit runtime environment. Inferred surfaces, including those resolved after tmux refresh, omit it because the lifecycle ID may belong to another terminal. Local connections probe `cmux --help` before optional sidebar status/log calls. Successful probes are cached per executable; failed probes retry on a later call. Restricted remote relays do not accept the legacy sidebar protocol, so the extension skips `set-status`, `clear-status`, and `log` on those transports. Notification and shell-state RPCs remain available.
+Current cmux builds expose notification and shell-state RPCs as well as the top-level `set-status`, `clear-status`, and `log` commands. `pi-cmux` uses the shell-state RPC for lifecycle activity with the captured surface ID. Reports include `CMUX_TERMINAL_LIFECYCLE_ID` only when both the surface and lifecycle ID still match the explicit runtime environment. Inferred surfaces, including those resolved after tmux refresh, omit it because the lifecycle ID may belong to another terminal. Local connections probe `cmux --help` before optional sidebar status/log calls, accepting both legacy command rows and v0.65.0's grouped help layout. Successful probes are cached per executable; failed probes retry on a later call. Restricted remote relays do not accept the legacy sidebar protocol, so the extension skips `set-status`, `clear-status`, and `log` on those transports. Notification and shell-state RPCs remain available.
 
 ## Configuration
 

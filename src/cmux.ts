@@ -263,18 +263,20 @@ export function buildNotificationArgs(
   env: CmuxEnv = process.env,
   paneLabel = "",
   resolvedSurfaceId = getSurfaceId(env),
-): string[] {
+): string[] | undefined {
+  const workspaceId = getWorkspaceId(env);
+  const relay = isRemoteRelay(env);
+  if (relay && (!workspaceId || !resolvedSurfaceId)) return undefined;
+
   const body = formatNotificationBody(input, paneLabel);
   const payload: { title: string; body?: string; workspace_id?: string; surface_id?: string } = { title: input.title };
   if (body) payload.body = body;
 
-  const workspaceId = getWorkspaceId(env);
   if (workspaceId) payload.workspace_id = workspaceId;
   if (resolvedSurfaceId) payload.surface_id = resolvedSurfaceId;
 
-  // notification.create_for_surface is local-only in current cmux. The scoped
-  // notification.create shape works locally and through SSH/cloud relays.
-  return ["rpc", "notification.create", JSON.stringify(payload)];
+  // Relays admit only the explicit workspace-and-surface notification method.
+  return ["rpc", relay ? "notification.create_for_target" : "notification.create", JSON.stringify(payload)];
 }
 
 export function buildSetStatusArgs(key: string, text: string, options: CmuxStatusOptions = {}): string[] {
@@ -461,7 +463,8 @@ export class CmuxClient {
 
     const paneLabel = await getTmuxPaneLabel(env, this.runner);
     const surfaceId = target ? target.surfaceId : await this.resolveSurfaceId(env);
-    await this.run(buildNotificationArgs(input, env, paneLabel, surfaceId), env, signal);
+    const args = buildNotificationArgs(input, env, paneLabel, surfaceId);
+    if (args) await this.run(args, env, signal);
   }
 
   async reportShellState(state: CmuxShellState, target?: CmuxTarget): Promise<boolean> {
@@ -600,7 +603,8 @@ export class CmuxClient {
     if (result.exitCode !== 0) throw new Error("cmux capability probe failed");
     const commands = new Set<string>();
     for (const line of `${result.stdout}\n${result.stderr}`.split(/\r?\n/)) {
-      const match = line.match(/^\s{2}([a-z][\w-]*)\b/);
+      // Legacy help has two-space rows; grouped help has four-space rows.
+      const match = line.match(/^ {2}(?: {2})?([a-z][\w-]*)\b/);
       if (match) commands.add(match[1]);
     }
     return commands;

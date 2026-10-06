@@ -40,7 +40,7 @@ test("resolves bundled cmux cli only when it exists", () => {
   assert.equal(resolveCmuxCli({}, () => false), "cmux");
 });
 
-test("builds relay-safe scoped notification payloads", () => {
+test("keeps local scoped notification payloads", () => {
   const args = buildNotificationArgs(
     { title: "Done", subtitle: "Task", body: "Ready" },
     {
@@ -50,6 +50,7 @@ test("builds relay-safe scoped notification payloads", () => {
     "[dev:1 %2]",
   );
 
+  assert.ok(args);
   assert.deepEqual(args.slice(0, 2), ["rpc", "notification.create"]);
   assert.deepEqual(JSON.parse(args[2]), {
     title: "Done",
@@ -62,8 +63,40 @@ test("builds relay-safe scoped notification payloads", () => {
 test("falls back to an unscoped notification without cmux context", () => {
   const args = buildNotificationArgs({ title: "Done" }, {}, "[pane]");
 
+  assert.ok(args);
   assert.deepEqual(args.slice(0, 2), ["rpc", "notification.create"]);
   assert.deepEqual(JSON.parse(args[2]), { title: "Done", body: "[pane]" });
+});
+
+test("builds relay notifications with both target identities and compatibility aliases", () => {
+  for (const socketKey of ["CMUX_SOCKET_PATH", "CMUX_SOCKET"]) {
+    for (const ids of [
+      { CMUX_WORKSPACE_ID: "workspace:1", CMUX_SURFACE_ID: "surface:1" },
+      { CMUX_TAB_ID: "workspace:1", CMUX_PANEL_ID: "surface:1" },
+    ]) {
+      const args = buildNotificationArgs(
+        { title: "Done", subtitle: "Task", body: "Ready" },
+        { ...ids, [socketKey]: "localhost:60000" },
+        "[dev:1 %2]",
+      );
+      assert.ok(args);
+      assert.deepEqual(args.slice(0, 2), ["rpc", "notification.create_for_target"]);
+      assert.deepEqual(JSON.parse(args[2]), {
+        title: "Done", body: "[dev:1 %2] Task — Ready", workspace_id: "workspace:1", surface_id: "surface:1",
+      });
+    }
+  }
+});
+
+test("relay notification payloads require both identities", () => {
+  for (const missing of [undefined, "", "  "]) {
+    assert.equal(buildNotificationArgs({ title: "Done" }, {
+      CMUX_SOCKET_PATH: "127.0.0.1:60000", CMUX_WORKSPACE_ID: missing, CMUX_SURFACE_ID: "surface:1",
+    }), undefined);
+    assert.equal(buildNotificationArgs({ title: "Done" }, {
+      CMUX_SOCKET_PATH: "127.0.0.1:60000", CMUX_WORKSPACE_ID: "workspace:1", CMUX_SURFACE_ID: missing,
+    }), undefined);
+  }
 });
 
 test("formats status and log commands without shell interpolation", () => {
@@ -391,7 +424,7 @@ test("client refreshes shared cmux env from tmux and resolves its surface", asyn
   assert.deepEqual(calls.map(({ socketPassword }) => socketPassword), ["process-password", "process-password"]);
   assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.current"]);
   assert.deepEqual(JSON.parse(calls[0].args[2]), { workspace_id: "workspace:new" });
-  assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create"]);
+  assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create_for_target"]);
   assert.deepEqual(JSON.parse(calls[1].args[2]), {
     title: "Done",
     workspace_id: "workspace:new",
@@ -442,7 +475,7 @@ test("client preserves inherited shared cmux values when tmux refresh is partial
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:60000", "127.0.0.1:60000"]);
   assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.current"]);
   assert.deepEqual(JSON.parse(calls[0].args[2]), { workspace_id: "workspace:old" });
-  assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create"]);
+  assert.deepEqual(calls[1].args.slice(0, 2), ["rpc", "notification.create_for_target"]);
   assert.deepEqual(JSON.parse(calls[1].args[2]), {
     title: "Done",
     workspace_id: "workspace:old",
@@ -501,10 +534,9 @@ test("client preserves inherited shared cmux env when tmux omits values", async 
     runner,
   }).notify({ title: "Done" });
 
-  assert.equal(calls.length, 2);
-  assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:50000", "127.0.0.1:50000"]);
-  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.current", "notification.create"]);
-  assert.deepEqual(JSON.parse(calls[1].args[2]), { title: "Done", workspace_id: "workspace:old" });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].socketPath, "127.0.0.1:50000");
+  assert.deepEqual(calls[0].args.slice(0, 2), ["rpc", "surface.current"]);
 });
 
 test("client no-ops outside cmux and swallows command failures", async () => {
@@ -618,7 +650,7 @@ test("client reports workspace-only shell state when no surface can be resolved"
   });
 });
 
-test("client skips unresolved relay shell state but still sends workspace notifications", async () => {
+test("client skips unresolved relay shell state and notifications", async () => {
   const calls: Array<readonly string[]> = [];
   const runner: CommandRunner = async (_command, args) => {
     calls.push(args);
@@ -634,8 +666,7 @@ test("client skips unresolved relay shell state but still sends workspace notifi
   await client.reportShellState("running");
   assert.deepEqual(calls.map((args) => args[1]), ["surface.current"]);
   await client.notify({ title: "Done" });
-  assert.deepEqual(calls.map((args) => args[1]), ["surface.current", "surface.current", "notification.create"]);
-  assert.deepEqual(JSON.parse(calls[2][2]), { title: "Done", workspace_id: "workspace:1" });
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.current", "surface.current"]);
 });
 
 test("client omits a refreshed tmux lifecycle when another terminal has focus", async () => {
@@ -738,6 +769,51 @@ test("client reports surface shell state explicitly", async () => {
     surface_id: "surface:2",
     state: "prompt",
   });
+});
+
+test("both help layouts support owned sidebar cleanup, logs and diagnostics", async (t) => {
+  // Command rows from v0.64.25 usage and v0.65.0 Automation task help.
+  const rows = [
+    "set-status <key> <value> [--workspace <id|ref|index>] [--window <id|ref|index>] [--icon <name>] [--color <#hex>] [--priority <n>]",
+    "clear-status <key> [--workspace <id|ref|index>] [--window <id|ref|index>]",
+    "log [--level <level>] [--source <name>] [--workspace <id|ref|index>] [--window <id|ref|index>] <message>",
+  ];
+  for (const grouped of [false, true]) {
+    for (const stream of ["stdout", "stderr"] as const) {
+      await t.test(`${grouped ? "v0.65.0 grouped" : "legacy"} help on ${stream}`, async () => {
+        const help = ["cmux - control cmux via Unix socket", "", "Commands:",
+          ...(grouped ? ["  Automation:"] : []),
+          ...rows.map((row) => `${grouped ? "    " : "  "}${row}`),
+        ].join("\n");
+        const env = { CMUX_WORKSPACE_ID: "workspace:original", CMUX_SURFACE_ID: "surface:original" };
+        const calls: Array<{ args: readonly string[]; workspaceId?: string; surfaceId?: string }> = [];
+        const client = new CmuxClient({ env, exists: () => false, runner: async (_command, args, options) => {
+          calls.push({ args, workspaceId: options?.env?.CMUX_WORKSPACE_ID, surfaceId: options?.env?.CMUX_SURFACE_ID });
+          if (args[0] === "--help") return { exitCode: 0, stdout: "", stderr: "", [stream]: help };
+          return { exitCode: args[0] === "set-status" ? 7 : 0, stdout: "", stderr: "" };
+        } });
+        const target = await client.captureTarget();
+        assert.equal(await client.setStatus("owner", "working", {}, target), "attempted");
+        env.CMUX_WORKSPACE_ID = "workspace:other";
+        env.CMUX_SURFACE_ID = "surface:other";
+        assert.equal(await client.clearStatus("owner", target), true);
+        await client.log("done", {}, target);
+        const diagnostics = await client.getDiagnostics(target);
+        assert.deepEqual(diagnostics.supportedCommands, ["set-status", "clear-status", "log"]);
+        assert.deepEqual(diagnostics.recentFailures, [{ operation: "set-status", exitCode: 7 }]);
+        assert.equal(diagnostics.transport, "local");
+        assert.equal(diagnostics.workspaceId, "workspace:original");
+        assert.equal(diagnostics.surfaceId, "surface:original");
+        assert.ok(calls.every(({ workspaceId, surfaceId }) => workspaceId === "workspace:original" && surfaceId === "surface:original"));
+        assert.deepEqual(calls.map(({ args }) => args), [
+          ["--help"],
+          ["set-status", "owner", "working", "--panel=surface:original", `--pid=${process.pid}`],
+          ["clear-status", "owner", "--panel=surface:original"],
+          ["log", "--", "done"],
+        ]);
+      });
+    }
+  }
 });
 
 test("client uses optional status commands only when supported", async () => {
@@ -905,7 +981,7 @@ test("captured tmux target survives focus, workspace and relay-port changes", as
   socketPath = "127.0.0.1:60000";
   await client.reportShellState("prompt", target);
   await client.notify({ title: "Done" }, target);
-  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.current", "surface.report_shell_state", "surface.report_shell_state", "notification.create"]);
+  assert.deepEqual(calls.map(({ args }) => args[1]), ["surface.current", "surface.report_shell_state", "surface.report_shell_state", "notification.create_for_target"]);
   assert.deepEqual(calls.map(({ socketPath }) => socketPath), ["127.0.0.1:50000", "127.0.0.1:50000", "127.0.0.1:60000", "127.0.0.1:60000"]);
   for (const { args } of calls.slice(1)) {
     const payload = JSON.parse(args[2]);
@@ -1019,8 +1095,45 @@ test("client rejects unsafe relay targets and records lookup failures", async (t
       await client.notify({ title: "Done" }, target);
       assert.deepEqual(calls.map((args) => args[1]), ["surface.current"]);
       assert.deepEqual((await client.getDiagnostics(target)).recentFailures, entry.failure ? [entry.failure] : []);
+      await client.notify({ title: "Done" });
+      assert.deepEqual(calls.map((args) => args[1]), ["surface.current", "surface.current"]);
+      assert.deepEqual((await client.getDiagnostics(target)).recentFailures, entry.failure ? [entry.failure, entry.failure] : []);
     });
   }
+});
+
+test("relay notifications skip missing workspace identity without falling back to focus", async () => {
+  const calls: Array<readonly string[]> = [];
+  const client = new CmuxClient({
+    env: { CMUX_SOCKET_PATH: "localhost:60000", CMUX_SURFACE_ID: "surface:focused" }, exists: () => false,
+    runner: async (_command, args) => { calls.push(args); return { exitCode: 0, stdout: "", stderr: "" }; },
+  });
+  await client.notify({ title: "Done" });
+  await client.notify({ title: "Done" }, { surfaceId: "surface:owned" });
+  assert.deepEqual(calls, []);
+});
+
+test("relay notification diagnostics name the scoped RPC and omit private content", async () => {
+  const calls: Array<readonly string[]> = [];
+  const client = new CmuxClient({
+    env: {
+      CMUX_SOCKET_PATH: "localhost:60000", CMUX_WORKSPACE_ID: "workspace:1", CMUX_SURFACE_ID: "surface:1",
+      CMUX_SOCKET_PASSWORD: "secret-password", CMUX_SOCKET_CAPABILITY: "secret-capability",
+    },
+    exists: () => false,
+    runner: async (_command, args) => {
+      calls.push(args);
+      return { exitCode: 7, stdout: "private stdout", stderr: "secret-password secret-capability private stderr" };
+    },
+  });
+  await client.notify({ title: "private title", body: "private body" });
+  assert.deepEqual(calls[0].slice(0, 2), ["rpc", "notification.create_for_target"]);
+  const diagnostics = await client.getDiagnostics();
+  assert.equal(calls.length, 1);
+  assert.equal(diagnostics.transport, "relay");
+  assert.deepEqual(diagnostics.supportedCommands, []);
+  assert.deepEqual(diagnostics.recentFailures, [{ operation: "rpc notification.create_for_target", exitCode: 7 }]);
+  assert.ok(!/secret|private/.test(JSON.stringify(diagnostics)));
 });
 
 test("an unresolved captured target never falls back to focus on local or relay connections", async () => {
@@ -1058,7 +1171,7 @@ test("relay transports skip legacy sidebar commands even after a successful loca
   assert.deepEqual(calls, []);
   await client.reportShellState("running");
   await client.notify({ title: "Done" });
-  assert.deepEqual(calls.map((args) => args[1]), ["surface.report_shell_state", "notification.create"]);
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.report_shell_state", "notification.create_for_target"]);
   const diagnostics = await client.getDiagnostics();
   assert.equal(diagnostics.transport, "relay");
   assert.deepEqual(diagnostics.supportedCommands, []);

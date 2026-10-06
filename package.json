@@ -1,6 +1,6 @@
 {
   "name": "@devnazim/pi-cmux",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "description": "cmux notifications and status integration for pi.",
   "type": "module",
   "keywords": [
@@ -39,7 +39,7 @@
     "@earendil-works/pi-coding-agent": ">=0.80.4"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "^1.0.2",
+    "@earendil-works/pi-coding-agent": "^1.0.4",
     "@types/node": "^24.19.1",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
