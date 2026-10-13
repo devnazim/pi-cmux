@@ -252,6 +252,47 @@ test("selects current cmux focused and selected-in-pane surface fields", () => {
   );
 });
 
+test("surface selection excludes explicit non-terminal panels and keeps terminal priority", () => {
+  const terminals = [
+    { id: "surface:first", type: "terminal" },
+    { id: "surface:selected", type: "terminal", selected: true },
+    { id: "surface:pane", type: "terminal", selected_in_pane: true },
+    { id: "surface:focused", type: "terminal", focused: true },
+  ];
+  const browser = { id: "surface:browser", type: "browser", focused: true, selected_in_pane: true, selected: true };
+
+  for (const [count, expected] of [
+    [4, "surface:focused"],
+    [3, "surface:pane"],
+    [2, "surface:selected"],
+    [1, "surface:first"],
+  ] as const) {
+    assert.equal(pickBestSurfaceId({ surfaces: [browser, ...terminals.slice(0, count)] }), expected);
+  }
+  assert.equal(pickBestSurfaceId({ surfaces: [browser] }), undefined);
+  assert.equal(pickBestSurfaceId([{ id: "surface:other", type: "other", focused: true }]), undefined);
+});
+
+test("legacy untyped surface lists keep focus and selection priority", () => {
+  const surfaces = [
+    { id: "surface:first" },
+    { id: "surface:selected", selected: true },
+    { id: "surface:pane", selected_in_pane: true },
+    { id: "surface:focused", focused: true },
+  ];
+  for (const [count, expected] of [
+    [4, "surface:focused"],
+    [3, "surface:pane"],
+    [2, "surface:selected"],
+    [1, "surface:first"],
+  ] as const) {
+    const entries = surfaces.slice(0, count);
+    for (const list of [entries, { surfaces: entries }, { data: entries }, { items: entries }]) {
+      assert.equal(pickBestSurfaceId(list), expected);
+    }
+  }
+});
+
 test("surface resolver uses workspace-scoped relay lookup and keeps local selection", async () => {
   const relayCalls: Array<readonly string[]> = [];
   const workspaceId = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee";
@@ -989,6 +1030,70 @@ test("captured tmux target survives focus, workspace and relay-port changes", as
     assert.equal(payload.surface_id, "surface:original");
     assert.equal(payload.terminal_lifecycle_id, undefined);
   }
+});
+
+test("captured local tmux target selects a terminal beside a focused browser and keeps lifecycle delivery", async () => {
+  const calls: Array<readonly string[]> = [];
+  const client = new CmuxClient({
+    env: {
+      TMUX: "/tmp/mock-tmux",
+      CMUX_WORKSPACE_ID: "workspace:1",
+      CMUX_SURFACE_ID: "surface:stale",
+      CMUX_TERMINAL_LIFECYCLE_ID: "lifecycle:stale",
+    },
+    exists: () => false,
+    runner: async (command, args) => {
+      if (command === "tmux") return { exitCode: 0, stdout: "CMUX_WORKSPACE_ID=workspace:1", stderr: "" };
+      calls.push(args);
+      if (args[1] === "surface.list") {
+        return {
+          exitCode: 0,
+          stdout: JSON.stringify({ surfaces: [
+            { id: "surface:browser", type: "browser", focused: true },
+            { id: "surface:terminal", type: "terminal" },
+          ] }),
+          stderr: "",
+        };
+      }
+      return { exitCode: 0, stdout: "", stderr: "" };
+    },
+  });
+
+  const target = await client.captureTarget();
+  assert.deepEqual(target, { workspaceId: "workspace:1", surfaceId: "surface:terminal", terminalLifecycleId: undefined });
+  assert.equal(await client.reportShellState("running", target), true);
+  assert.equal(await client.reportShellState("prompt", target), true);
+  await client.notify({ title: "Done" }, target);
+  assert.deepEqual(calls.map((args) => args[1]), [
+    "surface.list", "surface.report_shell_state", "surface.report_shell_state", "notification.create",
+  ]);
+  assert.deepEqual(calls.slice(1).map((args) => JSON.parse(args[2])), [
+    { workspace_id: "workspace:1", surface_id: "surface:terminal", state: "running" },
+    { workspace_id: "workspace:1", surface_id: "surface:terminal", state: "prompt" },
+    { title: "Done", workspace_id: "workspace:1", surface_id: "surface:terminal" },
+  ]);
+});
+
+test("browser-only local discovery stays unresolved and captured delivery never falls back to focus", async () => {
+  const calls: Array<readonly string[]> = [];
+  const runner: CommandRunner = async (_command, args) => {
+    calls.push(args);
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({ surfaces: [{ id: "surface:browser", type: "browser", focused: true }] }),
+      stderr: "",
+    };
+  };
+  const env = { CMUX_WORKSPACE_ID: "workspace:1", CMUX_SURFACE_ID: undefined as string | undefined };
+  assert.equal(await resolveCmuxSurfaceId(env, () => false, runner), undefined);
+  const client = new CmuxClient({ env, exists: () => false, runner });
+  const target = await client.captureTarget();
+  assert.deepEqual(target, { workspaceId: "workspace:1", surfaceId: undefined, terminalLifecycleId: undefined });
+  env.CMUX_SURFACE_ID = "surface:new-focus";
+  assert.equal(await client.reportShellState("running", target), false);
+  assert.equal(await client.reportShellState("prompt", target), false);
+  await client.notify({ title: "Done" }, target);
+  assert.deepEqual(calls.map((args) => args[1]), ["surface.list", "surface.list"]);
 });
 
 test("captured target keeps sidebar ownership and drops a replaced lifecycle token", async () => {

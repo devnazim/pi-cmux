@@ -6,9 +6,15 @@ cmux notifications and status integration for [pi](https://pi.dev).
 
 Package name: `@devnazim/pi-cmux`. See [release notes](CHANGELOG.md).
 
-Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.0.4. Its cmux integration is source-checked against the [v0.65.0 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.65.0), with mocked transport regression tests. Live cmux behavior has not been tested. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
+Compatibility: `pi-cmux` requires Pi 0.80.4 or newer and is tested against Pi 1.2.0. Its cmux integration is source-checked against the [v0.65.1 CLI/RPC contract](https://github.com/manaflow-ai/cmux/releases/tag/v0.65.1), with mocked CLI tests and isolated socket tests. The cmux-tui daemon accepted a live test notification, and the user confirmed seeing it. Live Mac CLI/RPC relay delivery has not been tested. It uses the `agent_settled` lifecycle event so retries, compaction, and queued continuations do not trigger premature completion notifications. Input-wait alerts require Pi 0.84.4 or newer, which provides the UI prompt events.
 
-Current cmux releases also provide a first-party Pi extension through `cmux hooks pi install` and `cmux hooks setup`. Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic activity or notification updates. Otherwise, enabling both lifecycle integrations can produce duplicate completion and input-wait notifications.
+cmux-tui notifications use its separate resource API v2 over an explicit local socket. No cmux executable is required for that transport. Mac CLI and SSH relay support remain separate; cmux-tui IDs are not Mac workspace or surface IDs.
+
+Current cmux releases also provide a first-party Pi extension. cmux's Pi launcher can load it automatically, without `cmux hooks pi install` or `cmux hooks setup`. Enabling both lifecycle integrations can produce duplicate completion and input-wait notifications.
+
+Set `"lifecycle": false` in this package's configuration when using the first-party hook. This keeps the cross-extension notifier API and `/cmux-status` without competing automatic updates.
+
+To use `pi-cmux` for lifecycle updates instead, set `CMUX_PI_HOOKS_DISABLED=1` when starting Pi. This prevents cmux launcher injection and makes the v0.65.1 first-party hook skip delivery even if separately installed. It does not uninstall the hook.
 
 ## pi-agent-suite compatibility
 
@@ -50,17 +56,37 @@ pi -e /path/to/pi-cmux
 | Session shuts down/reloads | discard queued deliveries and clear owned activity/status |
 | Optional extension notification | popup/status/log best-effort, controlled by the caller |
 
-All cmux calls are best-effort. Lifecycle handlers enqueue delivery without waiting for cmux, so a slow CLI does not delay agent startup or settlement. The queue preserves report order. A new run cancels obsolete completion delivery. Shutdown waits for in-flight delivery and owned cleanup, but discards pending notifications. Failed cleanup remains owned so shutdown can retry it. Abrupt process exits, including Pi's dead-terminal emergency exit, can skip extension shutdown. Each subprocess has a three-second timeout.
+The cmux-tui transport delivers completion, error, input-wait, and explicit notifications. It skips Mac shell-state, sidebar status, and log commands, and does not install native agent hooks or change agent badges.
+
+All cmux calls are best-effort. Lifecycle handlers enqueue delivery without waiting for cmux, so a slow CLI does not delay agent startup or settlement. The queue preserves report order. A new run cancels obsolete completion delivery. Shutdown waits for in-flight delivery and owned cleanup, but discards pending notifications. Failed cleanup remains owned so shutdown can retry it. Abrupt process exits, including Pi's dead-terminal emergency exit, can skip extension shutdown. Subprocesses and cmux-tui socket requests have three-second timeouts. Socket mutations are sent once and are not retried after an uncertain result.
 
 Each Pi session uses its own sidebar status key, registered with its local process PID and captured panel. Finishing one session does not clear another session's sidebar entry. cmux can remove owned entries after the process exits or the panel closes. Failed clears from retired sessions remain in a process-local retry list across extension reloads and retry on later session/start events.
 
-Aborted runs do not generate success popups; failed runs use `notifications.error`, independently of `notifications.done`. Automatic completion and input-wait popups are disabled outside TUI mode unless `notifications.headless` is enabled. Activity reporting and logs are unaffected by this popup guard.
+Aborted runs do not generate success popups; failed runs, including responses truncated at the model's output token limit, use `notifications.error`, independently of `notifications.done`. On Pi 1.1.0 and newer, the settled event's cancellation flag takes priority over the last assistant message. Older versions infer cancellation from the assistant message's stop reason. Automatic completion and input-wait popups are disabled outside TUI mode unless `notifications.headless` is enabled. Activity reporting and logs are unaffected by this popup guard.
 
 Input-wait alerts cover blocking `ctx.ui` dialogs, not assistant text asking a question. They use a generic body, without dialog titles, contents, or answers. Closing a prompt cancels a queued or in-flight delivery where possible; an already-delivered desktop notification cannot be withdrawn. Alerts follow Pi's delivered prompt events. Delayed handlers in other extensions can cause separate waiting episodes to be grouped together.
 
-## cmux, SSH, and tmux behavior
+## cmux-tui notifications
 
-`pi-cmux` detects cmux with:
+A Pi process inside a cmux-tui terminal receives its own socket and terminal identity. `pi-cmux` recognizes:
+
+- `CMUX_TUI_SOCKET`, or compatibility `CMUX_MUX_SOCKET`
+- `CMUX_TUI_TERMINAL_ID`
+- optional `CMUX_TUI_SESSION_ID`
+
+It sends a resource API v2 `notification.create` request directly to that socket, naming the explicit terminal. A supplied session ID is retained; without one, the socket's current session is used. No terminal focus lookup, helper executable, or machine-specific installation path is needed.
+
+Titles and subtitles are limited to 512 Unicode characters, bodies to 4096. Oversized requests skip delivery.
+
+Lifecycle delivery captures the socket, terminal, and session together. Later environment or focus changes cannot redirect a pending completion. Missing or invalid targets skip delivery instead of sending a session-global notification or falling back to another transport. Unsupported protocols and failed sockets are best-effort failures, not reasons to retry against another endpoint.
+
+Socket and terminal identity remain process-scoped. `pi-cmux` does not import cmux-tui socket capabilities or terminal IDs from tmux's shared environment, where they can belong to another attachment. Start Pi from the intended cmux-tui terminal if a pre-existing tmux pane lacks those variables.
+
+cmux-tui has its own separately installed Pi hook adapter. Do not enable automatic notifications from both integrations for the same process. This package neither installs nor changes that adapter. The `ssh-tmux` control-mode mirror is another transport; its OSC notification path is not implemented here.
+
+## Mac cmux, SSH relay, and tmux behavior
+
+`pi-cmux` detects the Mac CLI/RPC environment with:
 
 - `CMUX_WORKSPACE_ID` or compatibility `CMUX_TAB_ID`
 - `CMUX_SURFACE_ID` or compatibility `CMUX_PANEL_ID`
@@ -77,7 +103,7 @@ For SSH/tmux/surface-aware notifications, it targets the active cmux surface by 
 
 If neither is present but `CMUX_WORKSPACE_ID` or `CMUX_TAB_ID` exists, lookup depends on the connection:
 
-- Local connections use `surface.list` and choose the focused surface, then the selected-in-pane surface, then the first surface.
+- Local connections use `surface.list`, exclude explicitly non-terminal panels such as browsers, and choose the focused surface, then the selected-in-pane surface, then the first eligible surface. Legacy entries without a type remain supported.
 - Relay connections use `surface.current` with an explicit `workspace_id`. `pi-cmux` accepts only a non-empty terminal surface whose returned `workspace_id` or `workspace_ref` matches the requested workspace. UUID comparisons ignore letter case. Failed commands, malformed responses, ownership mismatches, and non-terminal results leave the surface unresolved.
 
 Relay discovery is workspace-scoped and best-effort. Current cmux relay routing returns the first active remote terminal surface, or a mirrored tmux pane. It does not use the Mac's locally focused panel and cannot guarantee exact pane attribution when a workspace has several remote surfaces.
@@ -138,7 +164,7 @@ With `lifecycle: false`, explicit notifier requests still follow `status`, `logs
 
 ## Diagnostics
 
-Run `/cmux-status` in Pi to inspect detection, CLI path, local or relay transport, workspace/surface target, optional command support, configuration, and pending retired-status cleanup count. It also shows up to five recent cmux failures as operation names and exit codes. Failed capability probes appear as `null`; unsupported commands appear as an empty list.
+Run `/cmux-status` in Pi to inspect detection, CLI path where used, transport, target, optional command support, configuration, and pending retired-status cleanup count. cmux-tui diagnostics identify the `tui` transport and terminal/session IDs without exposing its socket capability. It also shows up to five recent cmux failures as operation names and numeric failure codes. Failed capability probes appear as `null`; unsupported commands appear as an empty list.
 
 The command does not send a desktop notification. It excludes credentials, notification contents, and raw subprocess output. It does not enable cmux's first-party hooks or change configuration.
 

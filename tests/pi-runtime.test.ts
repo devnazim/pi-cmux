@@ -114,15 +114,15 @@ test("installed Pi loads the package and delivers its lifecycle through the real
   await snapshot(true);
   pending = true;
   await runner.emit({ type: "agent_end", messages: [message] });
-  await runner.emit({ type: "agent_settled" });
+  await runner.emit({ type: "agent_settled", aborted: false });
   assert.deepEqual((await snapshot()).calls, ["shell:running", "status:queued"], "agent_end is not completion");
   await snapshot(true);
   pending = false;
   await runner.emit({ type: "agent_start" });
   await runner.emit({ type: "agent_end", messages: [message] });
   idle = true;
-  await runner.emit({ type: "agent_settled" });
-  await runner.emit({ type: "agent_settled" });
+  await runner.emit({ type: "agent_settled", aborted: false });
+  await runner.emit({ type: "agent_settled", aborted: false });
   const completed = await snapshot();
   assert.deepEqual(completed.calls, [
     "shell:running", "status:working", "shell:prompt", "clear",
@@ -131,17 +131,26 @@ test("installed Pi loads the package and delivers its lifecycle through the real
   ]);
   assert.equal(new Set(completed.statusKeys).size, 1, "one status owner per session");
 
-  for (const stopReason of ["error", "aborted"] as const) {
+  for (const stopReason of ["error", "length", "aborted"] as const) {
     await snapshot(true);
     await runner.emit({ type: "agent_start" });
     await runner.emit({ type: "agent_end", messages: [{ ...message, stopReason }] });
-    await runner.emit({ type: "agent_settled" });
+    await runner.emit({ type: "agent_settled", aborted: stopReason === "aborted" });
     assert.deepEqual((await snapshot()).calls, [
       "shell:running", "status:working", "shell:prompt", "clear",
-      ...(stopReason === "error" ? ["notify:Pi error: Compatibility test:Run failed. Check Pi for details."] : []),
-      stopReason === "error" ? "log:error:Pi error: Compatibility test: run failed" : "log:info:Pi cancelled: Compatibility test: run cancelled",
+      ...(stopReason !== "aborted" ? ["notify:Pi error: Compatibility test:Run failed. Check Pi for details."] : []),
+      stopReason !== "aborted" ? "log:error:Pi error: Compatibility test: run failed" : "log:info:Pi cancelled: Compatibility test: run cancelled",
     ]);
   }
+
+  await snapshot(true);
+  await runner.emit({ type: "agent_start" });
+  await runner.emit({ type: "agent_end", messages: [message] });
+  await runner.emit({ type: "agent_settled", aborted: true });
+  assert.deepEqual((await snapshot()).calls, [
+    "shell:running", "status:working", "shell:prompt", "clear",
+    "log:info:Pi cancelled: Compatibility test: run cancelled",
+  ], "cancellation after a successful assistant response must not notify completion");
 
   await snapshot(true);
   let answer!: (value: boolean) => void;
@@ -167,7 +176,7 @@ test("installed Pi loads the package and delivers its lifecycle through the real
   runner.setUIContext(undefined, "print");
   await runner.emit({ type: "agent_start" });
   await runner.emit({ type: "agent_end", messages: [message] });
-  await runner.emit({ type: "agent_settled" });
+  await runner.emit({ type: "agent_settled", aborted: false });
   runner.setUIContext({ ...runner.getUIContext(), notify: (message) => { uiMessages.push(message); } }, "print");
   assert.deepEqual((await snapshot()).calls, [
     "shell:running", "status:working", "shell:prompt", "clear",

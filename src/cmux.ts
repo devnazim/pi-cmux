@@ -3,6 +3,7 @@ import { accessSync, constants, existsSync, statSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
+import { isTuiEnv, isValidTuiTarget, sendTuiNotification, tuiTargetFromEnv, type TuiTarget } from "./tui.js";
 import type { PiCmuxLogLevel } from "./types.js";
 
 export type CmuxEnv = Record<string, string | undefined>;
@@ -39,7 +40,9 @@ export interface CmuxLogOptions {
 
 export type CmuxShellState = "prompt" | "running" | "unknown";
 
-export interface CmuxTarget {
+export interface CmuxTarget extends TuiTarget {
+  // An absent discriminator is the existing Mac local/relay target.
+  transport?: "tui";
   workspaceId?: string;
   surfaceId?: string;
   terminalLifecycleId?: string;
@@ -48,9 +51,11 @@ export interface CmuxTarget {
 export interface CmuxDiagnostics {
   available: boolean;
   cli: string;
-  transport: "local" | "relay";
+  transport: "local" | "relay" | "tui";
   workspaceId?: string;
   surfaceId?: string;
+  terminalId?: string;
+  sessionId?: string;
   supportedCommands: string[] | null;
   recentFailures: Array<{ operation: string; exitCode: number }>;
 }
@@ -100,6 +105,7 @@ function isExecutableFile(path: string): boolean {
 }
 
 export function isInCmuxEnv(env: CmuxEnv = process.env, exists: ExistsFn = existsSync): boolean {
+  if (isTuiEnv(env)) return isValidTuiTarget(tuiTargetFromEnv(env));
   if (nonEmpty(env.CMUX_WORKSPACE_ID)) return true;
   if (nonEmpty(env.CMUX_TAB_ID)) return true;
   if (nonEmpty(env.CMUX_SURFACE_ID)) return true;
@@ -197,6 +203,7 @@ function surfaceListEntries(value: unknown): unknown[] {
 export function pickBestSurfaceId(surfaceList: unknown): string | undefined {
   const surfaces = surfaceListEntries(surfaceList)
     .filter(isRecord)
+    .filter((surface) => surface.type === undefined || surface.type === "terminal")
     .map((surface) => ({
       id: nonEmpty(typeof surface.id === "string" ? surface.id : undefined),
       focused: surface.focused,
@@ -422,6 +429,7 @@ export class CmuxClient {
 
   async captureTarget(): Promise<CmuxTarget> {
     const env = await this.getRuntimeEnv();
+    if (isTuiEnv(env)) return { transport: "tui", ...tuiTargetFromEnv(env) };
     if (!isInCmuxEnv(env, this.exists)) return {};
     const surfaceId = await this.resolveSurfaceId(env);
     return {
@@ -433,6 +441,15 @@ export class CmuxClient {
 
   async getDiagnostics(target?: CmuxTarget): Promise<CmuxDiagnostics> {
     const env = await this.getRuntimeEnv(target);
+    if (this.usesTui(target)) {
+      const tui = target ?? tuiTargetFromEnv(env);
+      return {
+        available: isValidTuiTarget(tui), cli: "", transport: "tui",
+        terminalId: tui.terminalId && /^term_[0-9a-f]{32}$/.test(tui.terminalId) ? tui.terminalId : undefined,
+        sessionId: tui.sessionId && /^session_[0-9a-f]{32}$/.test(tui.sessionId) ? tui.sessionId : undefined,
+        supportedCommands: [], recentFailures: this.recentFailures.map((failure) => ({ ...failure })),
+      };
+    }
     const available = isInCmuxEnv(env, this.exists);
     const relay = isRemoteRelay(env);
     let supportedCommands: string[] | null = relay || !available ? [] : null;
@@ -457,8 +474,22 @@ export class CmuxClient {
 
   async notify(input: CmuxNotificationInput, target?: CmuxTarget, signal?: AbortSignal): Promise<void> {
     // A captured lifecycle target must never fall back to current focus.
-    if (signal?.aborted || (target && !target.surfaceId)) return;
+    if (signal?.aborted) return;
+    const tui = this.usesTui(target);
+    if (!tui && target && !target.surfaceId) return;
     const env = await this.getRuntimeEnv(target);
+    if (tui) {
+      const tuiTarget = target ?? tuiTargetFromEnv(env);
+      if (!isValidTuiTarget(tuiTarget)) return;
+      const paneLabel = await getTmuxPaneLabel(env, this.runner);
+      const result = await sendTuiNotification(tuiTarget, {
+        title: input.title,
+        body: formatNotificationBody({ body: input.body }, paneLabel) ?? "",
+        ...(input.subtitle !== undefined ? { subtitle: input.subtitle } : {}),
+      }, signal);
+      if (result !== "delivered" && result !== "cancelled") this.recordFailure(`notification.create ${result}`, 1);
+      return;
+    }
     if (!isInCmuxEnv(env, this.exists)) return;
 
     const paneLabel = await getTmuxPaneLabel(env, this.runner);
@@ -468,6 +499,7 @@ export class CmuxClient {
   }
 
   async reportShellState(state: CmuxShellState, target?: CmuxTarget): Promise<boolean> {
+    if (this.usesTui(target)) return false;
     if (target && !target.surfaceId) return false;
     const env = await this.getRuntimeEnv(target);
     if (!isInCmuxEnv(env, this.exists)) return false;
@@ -478,6 +510,7 @@ export class CmuxClient {
   }
 
   async setStatus(key: string, text: string, options?: CmuxStatusOptions, target?: CmuxTarget): Promise<"skipped" | "attempted"> {
+    if (this.usesTui(target)) return "skipped";
     if (target && (!target.workspaceId || !target.surfaceId)) return "skipped";
     let result: "skipped" | "attempted" = "skipped";
     await this.enqueueStatus(async () => {
@@ -494,6 +527,7 @@ export class CmuxClient {
   }
 
   async clearStatus(key: string, target?: CmuxTarget): Promise<boolean> {
+    if (this.usesTui(target)) return true;
     // Incomplete lifecycle targets cannot have written an owned sidebar entry.
     if (target && (!target.workspaceId || !target.surfaceId)) return true;
     let cleared = false;
@@ -509,6 +543,7 @@ export class CmuxClient {
   }
 
   async log(message: string, options?: CmuxLogOptions, target?: CmuxTarget): Promise<void> {
+    if (this.usesTui(target)) return;
     const env = await this.getRuntimeEnv(target);
     if (await this.supportsCliCommand("log", env)) {
       await this.run(buildLogArgs(message, options), env);
@@ -531,7 +566,13 @@ export class CmuxClient {
     return this.options.runner ?? execFileRunner;
   }
 
+  private usesTui(target?: CmuxTarget): boolean {
+    return target ? target.transport === "tui" : isTuiEnv(this.env);
+  }
+
   private async getRuntimeEnv(target?: CmuxTarget): Promise<CmuxEnv> {
+    // Socket capabilities and opaque IDs are process-scoped, never tmux shared state.
+    if (this.usesTui(target)) return { ...this.env };
     const env = await resolveRuntimeCmuxEnv(this.env, this.runner);
     if (!target) return env;
     // Refresh transport, not ownership. A reconnect must not move a pending
@@ -539,6 +580,11 @@ export class CmuxClient {
     const sameLifecycle = target.surfaceId === getSurfaceId(env) && target.terminalLifecycleId === nonEmpty(env.CMUX_TERMINAL_LIFECYCLE_ID);
     return {
       ...env,
+      // Existing Mac targets must not switch to tui after capture.
+      CMUX_TUI_SOCKET: undefined,
+      CMUX_MUX_SOCKET: undefined,
+      CMUX_TUI_TERMINAL_ID: undefined,
+      CMUX_TUI_SESSION_ID: undefined,
       CMUX_WORKSPACE_ID: target.workspaceId,
       CMUX_TAB_ID: undefined,
       CMUX_SURFACE_ID: target.surfaceId,
@@ -556,7 +602,7 @@ export class CmuxClient {
   }
 
   private async supportsCliCommand(commandName: string, env: CmuxEnv): Promise<boolean> {
-    if (!isInCmuxEnv(env, this.exists) || isRemoteRelay(env)) return false;
+    if (isTuiEnv(env) || !isInCmuxEnv(env, this.exists) || isRemoteRelay(env)) return false;
     try {
       const commands = await this.getSupportedCliCommands(env);
       return commands.has(commandName);

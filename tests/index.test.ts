@@ -16,7 +16,7 @@ type Context = {
   mode: "tui" | "json" | "rpc" | "print" | "sdk";
   ui: { notify(message: string, level: string): void };
 };
-type Handler = (event: { messages: unknown[]; kind?: string; title?: string }, ctx: Context) => void | Promise<void>;
+type Handler = (event: { messages: unknown[]; kind?: string; title?: string; aborted?: boolean }, ctx: Context) => void | Promise<void>;
 
 function deferred() {
   let resolve!: () => void;
@@ -81,10 +81,12 @@ test("formats done notification titles with optional session names", () => {
 test("classifies the latest assistant outcome without exposing its content", () => {
   assert.equal(completionOutcome([]), "unknown");
   assert.equal(completionOutcome([null, { role: "user" }]), "unknown");
-  for (const stopReason of ["stop", "length", "toolUse"]) {
+  for (const stopReason of ["stop", "toolUse"]) {
     assert.equal(completionOutcome([{ role: "assistant", stopReason }]), "success");
   }
-  assert.equal(completionOutcome([{ role: "assistant", stopReason: "error" }]), "error");
+  for (const stopReason of ["error", "length"]) {
+    assert.equal(completionOutcome([{ role: "assistant", stopReason }]), "error");
+  }
   assert.equal(completionOutcome([{ role: "assistant", stopReason: "aborted" }]), "aborted");
   assert.equal(completionOutcome([{ role: "assistant", stopReason: "stop", cmuxSuppressNotification: true }]), "aborted");
   assert.equal(completionOutcome([
@@ -194,6 +196,48 @@ test("aborted runs clean up without success popups", async () => {
   await h.emit("session_shutdown");
 });
 
+test("aborted settlements override successful, failed, and missing assistant outcomes", async () => {
+  for (const stopReason of ["stop", "toolUse", "error", "length", undefined]) {
+    const h = harness();
+    h.emit("agent_start");
+    await h.flush();
+    h.calls.length = 0;
+    h.emit("agent_end", stopReason ? [{ role: "assistant", stopReason }] : []);
+    const settled = h.handlers.get("agent_settled");
+    assert.ok(settled);
+    settled({ messages: [], aborted: true }, h.context);
+    await h.flush();
+    assert.deepEqual(h.calls, [
+      "shell:prompt", "clear", "log:info:Pi cancelled: Dependency update: run cancelled",
+    ], stopReason ?? "no assistant message");
+    await h.emit("session_shutdown");
+  }
+});
+
+test("absent and false settled flags retain message-based outcomes", async () => {
+  for (const aborted of [undefined, false]) {
+    for (const { stopReason, expected } of [
+      { stopReason: "stop", expected: ["notify:Pi done: Dependency update", "log:success:Pi done: Dependency update: ready for input"] },
+      { stopReason: "toolUse", expected: ["notify:Pi done: Dependency update", "log:success:Pi done: Dependency update: ready for input"] },
+      { stopReason: "error", expected: ["notify:Pi error: Dependency update", "log:error:Pi error: Dependency update: run failed"] },
+      { stopReason: "aborted", expected: ["log:info:Pi cancelled: Dependency update: run cancelled"] },
+      { stopReason: undefined, expected: [] },
+    ]) {
+      const h = harness();
+      h.emit("agent_start");
+      await h.flush();
+      h.calls.length = 0;
+      h.emit("agent_end", stopReason ? [{ role: "assistant", stopReason }] : []);
+      const settled = h.handlers.get("agent_settled");
+      assert.ok(settled);
+      settled({ messages: [], ...(aborted === undefined ? {} : { aborted }) }, h.context);
+      await h.flush();
+      assert.deepEqual(h.calls, ["shell:prompt", "clear", ...expected], `${aborted}/${stopReason}`);
+      await h.emit("session_shutdown");
+    }
+  }
+});
+
 test("failed runs respect error popup configuration and do not log success", async () => {
   for (const error of [true, false]) {
     const h = harness(normalizeConfig({ notifications: { done: false, error } }));
@@ -205,6 +249,25 @@ test("failed runs respect error popup configuration and do not log success", asy
     assert.ok(h.calls.includes("log:error:Pi error: Dependency update: run failed"));
     assert.ok(!h.calls.join("\n").includes("private provider details"));
     await h.emit("session_shutdown");
+  }
+});
+
+test("truncated responses use error preferences and never report success", async () => {
+  for (const mode of ["tui", "print"] as const) {
+    for (const error of [true, false]) {
+      const h = harness(normalizeConfig({ notifications: { done: false, error, headless: true } }));
+      const ctx = { ...h.context, mode };
+      h.emit("agent_start", [], ctx);
+      h.emit("agent_end", [{ role: "assistant", stopReason: "length", content: "private partial response" }], ctx);
+      h.emit("agent_settled", [], ctx);
+      await h.flush();
+      assert.deepEqual(h.calls, [
+        "capture", "shell:running", "status:working", "shell:prompt", "clear",
+        ...(error ? ["notify:Pi error: Dependency update"] : []),
+        "log:error:Pi error: Dependency update: run failed",
+      ]);
+      await h.emit("session_shutdown");
+    }
   }
 });
 

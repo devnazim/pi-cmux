@@ -62,8 +62,8 @@ export function completionOutcome(messages: readonly unknown[]): CompletionOutco
     const message = messages[index];
     if (!isRecord(message) || message.role !== "assistant") continue;
     if (message.stopReason === "aborted" || message.cmuxSuppressNotification === true) return "aborted";
-    if (message.stopReason === "error") return "error";
-    if (message.stopReason === "stop" || message.stopReason === "length" || message.stopReason === "toolUse") return "success";
+    if (message.stopReason === "error" || message.stopReason === "length") return "error";
+    if (message.stopReason === "stop" || message.stopReason === "toolUse") return "success";
     return "unknown";
   }
   return "unknown";
@@ -143,7 +143,7 @@ export function registerPiCmuxExtension(
 
   async function setPiStatus(state: SessionState, text: string, options: typeof STATUS_WORKING): Promise<void> {
     const target = await targetFor(state);
-    if (state.closed) return;
+    if (state.closed || target.transport === "tui") return;
     state.shellReported = true;
     await cmux.reportShellState("running", target);
     if (state.closed || !target.workspaceId || !target.surfaceId) return;
@@ -246,11 +246,11 @@ export function registerPiCmuxExtension(
     }
   });
 
-  pi.on("agent_settled", (_event, ctx) => {
+  pi.on("agent_settled", (event, ctx) => {
     const state = session;
     if (!config.lifecycle || !state.active || !ctx.isIdle()) return;
     state.active = false;
-    const outcome = state.outcome;
+    const outcome = "aborted" in event && event.aborted === true ? "aborted" : state.outcome;
     const generation = state.generation;
     const allowPopup = ctx.mode === "tui" || config.notifications.headless;
     const delivery = new AbortController();

@@ -1,5 +1,37 @@
 # Changelog
 
+## 0.2.5
+
+### Added
+
+- Direct cmux-tui resource API v2 notifications using `CMUX_TUI_SOCKET` or `CMUX_MUX_SOCKET`, with captured terminal and session routing. No cmux CLI or helper installation path is required.
+- cmux-tui transport diagnostics without exposing socket capabilities. Unsupported Mac shell-state, sidebar, and log commands are skipped on this transport.
+- Isolated cmux-tui socket and lifecycle tests covering target capture, aliases, cancellation, framing, deadlines, privacy, and failures without CLI fallback.
+
+### Fixed
+
+- Exclude known non-terminal panels from inferred local cmux targets so a focused browser cannot receive terminal lifecycle notifications. Retain legacy surface lists without type fields.
+- Treat responses truncated at the model's output token limit as failures rather than successful completions, in line with Pi 1.2.0's print-mode exit status. These notifications follow `notifications.error`; cancellation still takes priority.
+
+### Compatibility
+
+- Updated the Pi development dependency and related Pi packages to 1.2.0. The minimum supported Pi version remains 0.80.4.
+- Tested against Pi 1.2.0 with the real extension loader and offline agent sessions, including custom-message startup, queued continuations, and cancellation during startup.
+- Source-checked cmux v0.65.1. Its Mac notification, shell-state, sidebar, and tmux contracts remain compatible. Live Mac CLI/RPC relay delivery has not been tested.
+- The cmux-tui daemon accepted one live test notification using the new socket transport. The user confirmed seeing it.
+- Documented automatic first-party Pi hook loading through cmux's launcher and how to avoid duplicate notifications. No user configuration was changed.
+
+## 0.2.4
+
+### Fixed
+
+- Honor Pi 1.1.0's `agent_settled.aborted` flag so cancellation after a successful assistant response clears activity and logs cancellation without a completion popup. Keep the message-based fallback for older Pi versions.
+
+### Compatibility
+
+- Updated the Pi development dependency and related Pi packages to 1.1.0. The minimum supported Pi version remains 0.80.4.
+- Tested against Pi 1.1.0, including the offline real-loader and lifecycle test with settled-run cancellation coverage.
+
 ## 0.2.3
 
 ### Fixed
